@@ -1,4 +1,4 @@
-"""铃光记忆 · SQLite 存储。
+"""Human-like Memory · SQLite 存储。
 
 两张表：
   memories  长期记忆（一次对话总结一条）
@@ -46,6 +46,9 @@ class MemoryStore:
     def __init__(self, db_path: str, config: dict | None = None):
         self.db_path = db_path
         self.config = config or {}
+        # 语义检索（可选）：由插件初始化时注入，没注入就纯关键词
+        self.vector_index = None
+        self.embedding_client = None
 
     # ---------- 配置 ----------
 
@@ -64,7 +67,9 @@ class MemoryStore:
 
     @property
     def drop_threshold(self) -> float:
-        return float(self.config.get("importance_drop_threshold", 0.3) or 0.3)
+        raw = self.config.get("importance_drop_threshold", 0.3)
+        # 注意：不能用 `raw or 0.3`——0.0 是 falsy，会被错误地当成 0.3
+        return 0.3 if raw is None else float(raw)
 
     @property
     def dormant_keep_days(self) -> float:
@@ -180,7 +185,7 @@ class MemoryStore:
                 "USING fts5(content, atom_id UNINDEXED, tokenize='unicode61')"
             )
             await db.commit()
-        logger.info(f"[lingguang_mem] 存储已就绪: {self.db_path}")
+        logger.info(f"[human_like_mem] 存储已就绪: {self.db_path}")
 
     # ---------- 写：长期记忆 ----------
 
@@ -218,7 +223,10 @@ class MemoryStore:
             return False
         if atom.metadata.get("pinned"):
             return False
-        return float(atom.importance or 0) < self.drop_threshold
+        th = self.drop_threshold
+        if th <= 0:
+            return False  # 阈值设成 0 = 明确不要丢（迁移时用）
+        return float(atom.importance or 0) < th
 
     async def _resolve_partition(self, db, atom: Atom) -> str:
         """群聊按时间间隔、私聊按话题算分区键。"""
@@ -250,7 +258,7 @@ class MemoryStore:
         for atom in atoms:
             if self._should_drop(atom):
                 logger.info(
-                    f"[lingguang_mem] 重要性 {atom.importance:.2f} 低于阈值，丢弃: {atom.content[:40]}"
+                    f"[human_like_mem] 重要性 {atom.importance:.2f} 低于阈值，丢弃: {atom.content[:40]}"
                 )
                 continue
             kept.append(atom)
@@ -269,7 +277,7 @@ class MemoryStore:
                         atom.atom_id = hit[0]
                         ids.append(hit[0])
                         logger.info(
-                            f"[lingguang_mem] 暂存命中(相似 {hit[1]:.2f})，强化不新建: {atom.content[:30]}"
+                            f"[human_like_mem] 暂存命中(相似 {hit[1]:.2f})，强化不新建: {atom.content[:30]}"
                         )
                         continue
 
@@ -358,7 +366,7 @@ class MemoryStore:
             )
             if promote:
                 status = AtomStatus.ACTIVE.value
-                logger.info(f"[lingguang_mem] 暂存转正(次数 {count}, 置信 {conf:.2f})")
+                logger.info(f"[human_like_mem] 暂存转正(次数 {count}, 置信 {conf:.2f})")
         if status == AtomStatus.CANDIDATE.value:
             ttl = self.staging_ttl_days
         else:
@@ -381,47 +389,132 @@ class MemoryStore:
         limit: int = 5,
         session_id: str | None = None,
     ) -> list[Atom]:
-        """按关键词找原子。
+        """找跟查询最相关的记忆。
 
-        中文不走 FTS——unicode61 会把整句话当一个 token，「回消息」这种词根本匹配不上。
-        改成 2 字片段 LIKE，简单但好使（数据量几千条时扫描毫无压力）。
+        两路召回：
+          关键词路：带权检索词（停用词过滤 + 同义词扩展）LIKE 粗筛 → 打分
+          语义路  ：查询向量 vs 已建好的原子向量（没索引就自动跳过）
+        两路归一后加权合并，再去重取前 N。
         """
-        q = str(query or "").strip()
-        if not q:
+        from .retrieval import extract_terms, rerank, score_content
+        from .semantic import hybrid_rank
+
+        terms = extract_terms(query)
+        if not terms:
             return []
-        frags = self._fragments(q, max_pieces=8)
-        if not frags:
-            frags = [q]
-        conds = " OR ".join("content LIKE ?" for _ in frags)
+
+        # ---------- 关键词路 ----------
+        words = [t for t, _ in terms]
+        conds = " OR ".join("content LIKE ?" for _ in words)
         sql = (
             "SELECT * FROM atoms "
             f"WHERE status IN ('active','candidate','dormant') AND ({conds}) "
             "ORDER BY last_access DESC LIMIT ?"
         )
-        params: list[Any] = [f"%{f}%" for f in frags] + [max(1, limit * 5)]
+        params: list[Any] = [f"%{w}%" for w in words] + [max(30, limit * 10)]
+        kw_scores: dict[int, float] = {}
+        candidates: dict[int, Atom] = {}
         try:
             async with self._connect() as db:
                 cursor = await db.execute(sql, params)
                 rows = await cursor.fetchall()
+            for row in rows:
+                atom = self._row_to_atom(row)
+                s, hits, max_w = score_content(atom.content, terms)
+                if hits == 0 or max_w < 0.8:
+                    continue
+                if atom.status == AtomStatus.DORMANT.value:
+                    s *= 0.3
+                elif atom.status == AtomStatus.CANDIDATE.value:
+                    s *= float(self.config.get("staging_recall_penalty", 0.5) or 0.5)
+                s *= max(0.1, float(atom.importance or 0.5))
+                kw_scores[atom.atom_id] = s
+                candidates[atom.atom_id] = atom
         except Exception as e:
-            logger.warning(f"[lingguang_mem] 检索失败: {e!r}")
+            logger.warning(f"[human_like_mem] 关键词检索失败: {e!r}")
+
+        # ---------- 语义路 ----------
+        vec_scores: dict[int, float] = {}
+        if self.vector_index is not None and self.embedding_client is not None:
+            try:
+                qvec = await self.embedding_client.embed(query)
+                if qvec:
+                    for aid, sim in self.vector_index.search(qvec, top_k=max(20, limit * 6)):
+                        vec_scores[int(aid)] = float(sim)
+            except Exception as e:
+                logger.debug(f"[human_like_mem] 语义检索失败: {e!r}")
+
+        # 语义召回里有关键词没覆盖到的，补查出来
+        extra_ids = [aid for aid in vec_scores if aid not in candidates]
+        if extra_ids:
+            try:
+                ph = ",".join("?" * len(extra_ids))
+                async with self._connect() as db:
+                    cursor = await db.execute(
+                        f"SELECT * FROM atoms WHERE id IN ({ph}) "
+                        "AND status IN ('active','candidate','dormant')",
+                        extra_ids,
+                    )
+                    for row in await cursor.fetchall():
+                        atom = self._row_to_atom(row)
+                        candidates[atom.atom_id] = atom
+            except Exception as e:
+                logger.debug(f"[human_like_mem] 补查语义候选失败: {e!r}")
+
+        if not candidates:
             return []
 
-        penalty = float(self.config.get("staging_recall_penalty", 0.5) or 0.5)
-        scored: list[tuple[float, Atom]] = []
-        for row in rows:
-            atom = self._row_to_atom(row)
-            # 命中片段越多分越高
-            hit = sum(1 for f in frags if f in atom.content)
-            score = 0.4 + 0.6 * (hit / max(1, len(frags)))
-            if atom.status == AtomStatus.DORMANT.value:
-                score *= 0.3
-            elif atom.status == AtomStatus.CANDIDATE.value:
-                score *= penalty
-            score *= max(0.1, float(atom.importance or 0.5))
-            scored.append((score, atom))
-        scored.sort(key=lambda kv: kv[0], reverse=True)
-        return [a for _, a in scored[:limit]]
+        # ---------- 合并 ----------
+        if vec_scores:
+            ranked = hybrid_rank(kw_scores, vec_scores)
+            ordered = [candidates[aid] for aid, _ in ranked if aid in candidates]
+        else:
+            ordered = list(candidates.values())
+
+        # 最后按内容去重（同一件事的多个说法只留一条）。
+        # 有语义路参与时不再卡「强词」——语义召回的句子本来就不含查询原词。
+        has_vector = bool(vec_scores)
+        return rerank(
+            ordered,
+            query,
+            dormant_penalty=0.3,
+            candidate_penalty=float(self.config.get("staging_recall_penalty", 0.5) or 0.5),
+            limit=limit,
+            min_weight=0.0 if has_vector else 0.8,
+        )
+
+    async def hot_atoms(
+        self,
+        query: str = "",
+        hours: float = 48,
+        limit: int = 3,
+    ) -> list[Atom]:
+        """热记忆：最近动过的正式记忆；有查询时按相关性挑，而不是单纯按时间。"""
+        from .retrieval import extract_terms, rerank
+
+        cutoff = time.time() - hours * 3600.0
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT * FROM atoms WHERE status = ? AND last_access >= ? "
+                "ORDER BY last_access DESC LIMIT ?",
+                (AtomStatus.ACTIVE.value, cutoff, max(10, limit * 6)),
+            )
+            rows = await cursor.fetchall()
+        if not rows:
+            return []
+        atoms = [self._row_to_atom(r) for r in rows]
+
+        q = str(query or "").strip()
+        if q and extract_terms(q):
+            picked = rerank(atoms, q, dormant_penalty=0.3, candidate_penalty=0.5, limit=limit)
+            if picked:
+                return picked
+        # 没有查询或没匹配上：退回「最近动过的」
+        return atoms[:limit]
+
+    async def recent_atoms(self, hours: float = 48, limit: int = 3) -> list[Atom]:
+        """最近动过的正式记忆（不带查询时的简易版）。"""
+        return await self.hot_atoms(query="", hours=hours, limit=limit)
 
     async def recent_atoms(self, hours: float = 48, limit: int = 3) -> list[Atom]:
         """最近动过的正式记忆（热记忆）。"""
@@ -469,7 +562,7 @@ class MemoryStore:
                 cursor = await db.execute(sql, params)
                 rows = await cursor.fetchall()
         except Exception as e:
-            logger.debug(f"[lingguang_mem] 查历史失败: {e!r}")
+            logger.debug(f"[human_like_mem] 查历史失败: {e!r}")
             return []
         return [
             {
@@ -501,7 +594,7 @@ class MemoryStore:
             await db.commit()
             n1, n2 = c1.rowcount, c2.rowcount
         if n1:
-            logger.info(f"[lingguang_mem] {n1} 条暂存转待定（{keep:.0f} 天后删）")
+            logger.info(f"[human_like_mem] {n1} 条暂存转待定（{keep:.0f} 天后删）")
         return {"dormant": n1, "expired": n2}
 
     async def purge_dormant(self) -> int:
@@ -520,7 +613,7 @@ class MemoryStore:
                 await db.execute(f"DELETE FROM atoms WHERE id IN ({ph})", ids)
                 await db.commit()
         if ids:
-            logger.info(f"[lingguang_mem] 清理 {len(ids)} 条待定原子")
+            logger.info(f"[human_like_mem] 清理 {len(ids)} 条待定原子")
         return len(ids)
 
     # ---------- 问主人 ----------
@@ -537,7 +630,7 @@ class MemoryStore:
                 )
                 rows = await cursor.fetchall()
         except Exception as e:
-            logger.warning(f"[lingguang_mem] 查待问失败: {e!r}")
+            logger.warning(f"[human_like_mem] 查待问失败: {e!r}")
             return []
         return [self._row_to_atom(r) for r in rows]
 
@@ -568,7 +661,7 @@ class MemoryStore:
                 rows = await cursor.fetchall()
             return {int(r["memory_id"]) for r in rows if r["memory_id"]}
         except Exception as e:
-            logger.debug(f"[lingguang_mem] 查私密失败: {e!r}")
+            logger.debug(f"[human_like_mem] 查私密失败: {e!r}")
             return set()
 
     # ---------- 纠正 ----------

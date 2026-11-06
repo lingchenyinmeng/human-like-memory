@@ -136,5 +136,23 @@
     "hint": "每条上文截多少字，默认 100",
     "type": "int",
     "default": 100
+  },
+  "semantic_enabled": {
+    "description": "语义检索",
+    "hint": "auto=检测到本机 Ollama+bge-m3 就开；on=强制开（失败退回关键词）；off=关。需先跑 tools/build_embeddings.py 建索引。",
+    "type": "string",
+    "default": "auto"
+  },
+  "semantic_base_url": {
+    "description": "Ollama 地址",
+    "hint": "默认 http://127.0.0.1:11434",
+    "type": "string",
+    "default": "http://127.0.0.1:11434"
+  },
+  "semantic_model": {
+    "description": "嵌入模型",
+    "hint": "默认 bge-m3（1024 维）",
+    "type": "string",
+    "default": "bge-m3"
   }
 }

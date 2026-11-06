@@ -1,4 +1,4 @@
-"""铃光记忆 · 独立记忆插件。
+"""Human-like Memory · 独立记忆插件。
 
 从 livingmemory 的改造里抽出来的一套精简实现：
 - 双层记忆：短时库（candidate）+ 正式库（active/dormant）
@@ -39,7 +39,7 @@ class LingguangMemory(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.conf = config
-        self.data_dir = str(StarTools.get_data_dir("astrbot_plugin_lingguang_memory"))
+        self.data_dir = str(StarTools.get_data_dir("astrbot_plugin_human_like_memory"))
         os.makedirs(self.data_dir, exist_ok=True)
         self.memory_db = os.path.join(self.data_dir, "memory.db")
         self.conv_db = os.path.join(self.data_dir, "conversations.db")
@@ -114,11 +114,57 @@ class LingguangMemory(Star):
         await self.conv.initialize()
         self.summarizer = Summarizer(self.context, self._cfg())
         self.injector = Injector(self._cfg())
+
+        # 语义检索（可选）：装了 Ollama + bge-m3 且建过索引才启用
+        await self._init_semantic()
+
         self._loop_task = asyncio.create_task(self._loop(), name="lingguang-mem-loop")
         logger.info(
-            f"[lingguang_mem] 已启动 | 库: {self.memory_db} | "
+            f"[human_like_mem] 已启动 | 库: {self.memory_db} | "
             f"暂存 {self._cfg()['staging_ttl_hours']:.0f}h"
         )
+
+    async def _init_semantic(self) -> None:
+        """按配置决定要不要开语义检索。失败一律降级为纯关键词，不抛。"""
+        mode = str(self.conf.get("semantic_enabled", "auto") or "auto").strip().lower()
+        if mode == "off":
+            logger.info("[human_like_mem] 语义检索：按配置关闭")
+            return
+        if self.store is None:
+            return
+        try:
+            from .core.semantic import EmbeddingClient, VectorIndex
+
+            client = EmbeddingClient(
+                base_url=str(self.conf.get("semantic_base_url", "http://127.0.0.1:11434")),
+                model=str(self.conf.get("semantic_model", "bge-m3")),
+            )
+            if not await client.available():
+                if mode == "on":
+                    logger.warning(
+                        "[human_like_mem] 语义检索开着但 Ollama 不可用，本次退回纯关键词"
+                    )
+                else:
+                    logger.info("[human_like_mem] 没检测到 Ollama，语义检索自动跳过")
+                return
+
+            index = VectorIndex(self.memory_db)
+            await index.initialize()
+            if not await index.load():
+                logger.info(
+                    "[human_like_mem] 还没有向量索引；跑 tools/build_embeddings.py 建一次就能用上"
+                )
+                self.store.embedding_client = client
+                self.store.vector_index = index
+                return
+
+            self.store.embedding_client = client
+            self.store.vector_index = index
+            logger.info(
+                f"[human_like_mem] 语义检索已启用（{self.conf.get('semantic_model', 'bge-m3')}）"
+            )
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 语义检索初始化失败，退回纯关键词: {e!r}")
 
     async def terminate(self) -> None:
         task = self._loop_task
@@ -131,7 +177,7 @@ class LingguangMemory(Star):
                 pass
             except Exception:
                 pass
-        logger.info("[lingguang_mem] 已停止")
+        logger.info("[human_like_mem] 已停止")
 
     async def _loop(self) -> None:
         """后台：定期总结 + 生命周期 + 问主人。"""
@@ -142,7 +188,7 @@ class LingguangMemory(Star):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning(f"[lingguang_mem] 维护出错: {e!r}")
+                logger.warning(f"[human_like_mem] 维护出错: {e!r}")
             await asyncio.sleep(int(self.conf.get("maintain_interval_minutes", 10) or 10) * 60)
 
     async def _maintain(self) -> None:
@@ -153,12 +199,51 @@ class LingguangMemory(Star):
             await self.store.expire_stale()
             await self.store.purge_dormant()
         except Exception as e:
-            logger.warning(f"[lingguang_mem] 生命周期处理失败: {e!r}")
-        # 2. 问主人
+            logger.warning(f"[human_like_mem] 生命周期处理失败: {e!r}")
+        # 2. 给新记忆补向量（语义检索开着才做）
+        try:
+            await self._index_missing_vectors()
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 补向量失败: {e!r}")
+        # 3. 问主人
         try:
             await self._ask_owner()
         except Exception as e:
-            logger.warning(f"[lingguang_mem] 问主人失败: {e!r}")
+            logger.warning(f"[human_like_mem] 问主人失败: {e!r}")
+
+    async def _index_missing_vectors(self, batch: int = 64) -> int:
+        """给还没向量的原子补上（新记忆不会漏掉语义检索）。"""
+        store = self.store
+        if store is None or store.vector_index is None or store.embedding_client is None:
+            return 0
+        if not await store.embedding_client.available():
+            return 0
+        try:
+            async with store._connect() as db:
+                cursor = await db.execute(
+                    "SELECT id, content FROM atoms WHERE status IN ('active','candidate') "
+                    "ORDER BY id DESC LIMIT 500"
+                )
+                rows = await cursor.fetchall()
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 取待建向量原子失败: {e!r}")
+            return 0
+        if not rows:
+            return 0
+        id_to_text = {int(r[0]): str(r[1] or "") for r in rows}
+        missing = await store.vector_index.missing_ids(list(id_to_text.keys()), limit=batch)
+        if not missing:
+            return 0
+        texts = [id_to_text[a] for a in missing]
+        vecs = await store.embedding_client.embed_batch(texts)
+        pairs = [(a, v) for a, v in zip(missing, vecs) if v is not None]
+        if pairs:
+            await store.vector_index.save_many(
+                pairs, model=str(self.conf.get("semantic_model", "bge-m3"))
+            )
+            await store.vector_index.load(force=True)
+            logger.info(f"[human_like_mem] 新记忆补向量 {len(pairs)} 条")
+        return len(pairs)
 
     # ---------- 存消息 ----------
 
@@ -189,7 +274,7 @@ class LingguangMemory(Star):
             if n >= threshold:
                 asyncio.create_task(self._summarize_session(session_id))
         except Exception as e:
-            logger.debug(f"[lingguang_mem] 存消息失败: {e!r}")
+            logger.debug(f"[human_like_mem] 存消息失败: {e!r}")
 
     # ---------- 总结 ----------
 
@@ -217,11 +302,11 @@ class LingguangMemory(Star):
                 await self.store.add_atoms(atom_objs)
             await self.conv.mark_summarized(session_id, int(msgs[-1]["id"]))
             logger.info(
-                f"[lingguang_mem] {session_id} 总结完成: "
+                f"[human_like_mem] {session_id} 总结完成: "
                 f"记忆 #{mem.memory_id}, {len(atom_objs)} 个原子"
             )
         except Exception as e:
-            logger.error(f"[lingguang_mem] 总结会话失败: {e!r}", exc_info=True)
+            logger.error(f"[human_like_mem] 总结会话失败: {e!r}", exc_info=True)
 
     async def _build_atoms_for(self, mem: Memory, msgs: list[dict]) -> list[Atom]:
         if self.store is None:
@@ -253,7 +338,7 @@ class LingguangMemory(Star):
                     who_id, str(mem.key_facts[0]), days=cfg["backfill_lookback_days"]
                 )
             except Exception as e:
-                logger.debug(f"[lingguang_mem] 回溯失败: {e!r}")
+                logger.debug(f"[human_like_mem] 回溯失败: {e!r}")
 
         return build_atoms(
             mem.key_facts,
@@ -283,9 +368,16 @@ class LingguangMemory(Star):
         try:
             is_group = "GroupMessage" in str(event.unified_msg_origin or "")
             hot_n = int(self.conf.get("hot_memory_count", 3) or 3)
-            hot = await self.store.recent_atoms(hours=48, limit=hot_n)
             query = str(getattr(event, "message_str", "") or "").strip()
-            cold = await self.store.search_atoms(query, limit=int(self.conf.get("recall_top_k", 5) or 5)) if query else []
+            # 热记忆按相关性挑（有查询时），没查询才退回「最近动过的」
+            hot = await self.store.hot_atoms(query=query, hours=48, limit=hot_n)
+            cold = (
+                await self.store.search_atoms(
+                    query, limit=int(self.conf.get("recall_top_k", 5) or 5)
+                )
+                if query
+                else []
+            )
             merged: list[Atom] = []
             seen: set[int] = set()
             for a in (hot + cold):
@@ -306,9 +398,9 @@ class LingguangMemory(Star):
                 req.extra_user_content_parts.append(
                     TextPart(text=text).mark_as_temp()
                 )
-                logger.debug(f"[lingguang_mem] 注入 {len(merged)} 条记忆")
+                logger.debug(f"[human_like_mem] 注入 {len(merged)} 条记忆")
         except Exception as e:
-            logger.warning(f"[lingguang_mem] 注入失败: {e!r}")
+            logger.warning(f"[human_like_mem] 注入失败: {e!r}")
 
     # ---------- 问主人 ----------
 
@@ -348,9 +440,9 @@ class LingguangMemory(Star):
             )
             await self.store.mark_asked([a.atom_id for a in atoms])
             self._last_ask = time.time()
-            logger.info(f"[lingguang_mem] 已问主人 {len(atoms)} 条")
+            logger.info(f"[human_like_mem] 已问主人 {len(atoms)} 条")
         except Exception as e:
-            logger.warning(f"[lingguang_mem] 发问失败: {e!r}")
+            logger.warning(f"[human_like_mem] 发问失败: {e!r}")
 
     async def _platform_name(self) -> str:
         try:
@@ -434,7 +526,7 @@ class LingguangMemory(Star):
             await self.store.add_atoms([atom], enable_dedup=False)
             return f"记住了：{text[:50]}"
         except Exception as e:
-            logger.error(f"[lingguang_mem] 记忆写入失败: {e!r}")
+            logger.error(f"[human_like_mem] 记忆写入失败: {e!r}")
             return "没记上。"
 
     @filter.llm_tool(name="correct_memory")

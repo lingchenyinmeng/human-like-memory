@@ -1,4 +1,4 @@
-# 铃光记忆
+# Human-like Memory
 
 一套**独立的长期记忆插件**。不依赖 livingmemory，也不需要 Ollama 或向量库。
 
@@ -118,7 +118,7 @@
 ## 数据在哪
 
 ```
-data/plugin_data/astrbot_plugin_lingguang_memory/
+data/plugin_data/astrbot_plugin_human_like_memory/
 ├── memory.db          记忆与原子
 ├── conversations.db   原始消息（总结后 30 天清理）
 └── corrections.jsonl  你每次纠正的记录
@@ -131,10 +131,77 @@ data/plugin_data/astrbot_plugin_lingguang_memory/
 
 ## 安装
 
-1. 把整个 strbot_plugin_lingguang_memory 目录放进 AstrBot/data/plugins/
+1. 把整个 astrbot_plugin_human_like_memory 目录放进 AstrBot/data/plugins/
 2. 重启 AstrBot（新插件需要重启才会被扫描）
 3. 到插件配置页按需调整（全部有默认值，装完就能用）
 
+
+## 从 LivingMemory 迁移
+
+如果你之前用的是 LivingMemory，可以把它记的东西搬过来：
+
+```bash
+# 先看会迁多少，不写库
+python tools/migrate_from_livingmemory.py --dry-run
+
+# 真迁（写前会自动备份新库）
+python tools/migrate_from_livingmemory.py
+```
+
+**路径会自动探测**——脚本会从自己所在位置往上找 AstrBot 的 `data` 目录。
+找不到就手动指定：
+
+```bash
+python tools/migrate_from_livingmemory.py --old <旧库> --new <新库>
+```
+
+或者设环境变量 `ASTRBOT_DATA_DIR` 指向 AstrBot 的 `data` 目录。
+
+**迁移会保留**：内容、摘要、key_facts、参与者、重要性、时间、状态、说话人、定性、隐私标记。
+**会重算**：话语类型（旧库是记忆类型，语义不同）。
+
+**重复跑不会重复插入**——每条迁过来的记忆在 metadata 里记了 `source_memory_id`。
+
+## 语义检索（可选）
+
+默认只用关键词。想让召回更准，可以接本机的 Ollama：
+
+```bash
+# 1. 确认 Ollama 有 bge-m3
+ollama pull bge-m3
+
+# 2. 给现有记忆建一次向量索引（957 条约 1 分钟）
+python tools/build_embeddings.py
+```
+
+建完重载插件，日志里出现「语义检索已启用」就成了。
+
+**之后新记忆会自动补向量**，不用再手动建。
+
+配置项：
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| `semantic_enabled` | `auto` | auto 自动检测；on 强制开；off 关 |
+| `semantic_base_url` | `http://127.0.0.1:11434` | Ollama 地址 |
+| `semantic_model` | `bge-m3` | 嵌入模型 |
+
+**没装 Ollama 也完全没问题**——自动退回纯关键词，不报错、不影响使用。
+
+### 效果
+
+| 查询 | 纯关键词 | 加语义 |
+|---|---|---|
+| 「说我讲得太细」 | 0 条 | **3 条**（说话太直 / 描述不用太具体 / 回话太绕） |
+| 「电脑里没钱了」 | 3 条（都是花费） | 3 条（把「找电脑里的 DeepSeek」提到第 1） |
+
+语义解决的是「换了说法就找不到」的问题。
+
+### 实现
+
+- 向量存 SQLite 单独表 `atom_vectors`，删掉这张表就等于关掉语义
+- 检索时全部读进内存暴力算余弦（957 条约 2ms，不用 faiss）
+- 关键词路和语义路各自归一到 0-1，按 0.55 : 0.45 加权
 ## 常见问题
 
 **Q：和 LivingMemory 能一起装吗？**
@@ -147,7 +214,7 @@ data/plugin_data/astrbot_plugin_lingguang_memory/
 中文短句用 2 字片段匹配已经够用，省掉 Ollama 和 faiss 能少踩很多坑。数据到几万条时再考虑加向量。
 
 **Q：记忆存在哪？**
-`data/plugin_data/astrbot_plugin_lingguang_memory/` 下的 memory.db 和 conversations.db，纯 SQLite，可以直接备份或查看。
+`data/plugin_data/astrbot_plugin_human_like_memory/` 下的 memory.db 和 conversations.db，纯 SQLite，可以直接备份或查看。
 
 ## 协议
 

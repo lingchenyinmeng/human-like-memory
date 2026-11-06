@@ -1,4 +1,4 @@
-"""铃光记忆 · 总结器：把一段对话变成一条记忆。
+"""Human-like Memory · 总结器：把一段对话变成一条记忆。
 
 要点：
 - 第一人称回顾，但必须写清「谁说了什么」——别人的话不许写进「我」嘴里
@@ -76,7 +76,7 @@ class Summarizer:
         try:
             provider = self.context.get_using_provider()
         except Exception as e:
-            logger.warning(f"[lingguang_mem] 拿不到模型: {e!r}")
+            logger.warning(f"[human_like_mem] 拿不到模型: {e!r}")
         if provider is None:
             return ""
         try:
@@ -87,7 +87,7 @@ class Summarizer:
             )
             return str(getattr(resp, "completion_text", "") or "")
         except Exception as e:
-            logger.warning(f"[lingguang_mem] 总结调用失败: {e!r}")
+            logger.warning(f"[human_like_mem] 总结调用失败: {e!r}")
             return ""
 
     async def summarize(
@@ -115,7 +115,7 @@ class Summarizer:
 
         data = self._parse(raw)
         if not data:
-            logger.warning(f"[lingguang_mem] 总结结果解析失败: {raw[:200]}")
+            logger.warning(f"[human_like_mem] 总结结果解析失败: {raw[:200]}")
             return None
 
         participants = [str(x) for x in (data.get("participants") or []) if str(x).strip()]
@@ -160,7 +160,7 @@ class Summarizer:
             metadata={"message_count": len(messages), "source": "summarizer"},
         )
         logger.info(
-            f"[lingguang_mem] 总结完成: {len(key_facts)} 条事实, 重要性 {importance:.2f}"
+            f"[human_like_mem] 总结完成: {len(key_facts)} 条事实, 重要性 {importance:.2f}"
         )
         return mem
 
