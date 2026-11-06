@@ -19,14 +19,17 @@ class AtomStatus(str, Enum):
     candidate  短时区：新写入、还没定性，默认只活 48 小时
     active     正式库：定性了，按类型算 TTL
     dormant    待定：到期没定性，压最底层（不主动召回，但相似时能翻出来）
+    archived   遗忘库：正式记忆放久了沉下去。**完全不参与检索**，
+               只有同样的事被重新提起时才会被拉起来
     dropped    丢弃：重要性太低，压根不留
     expired    过期：正式记忆到期
-    forgotten  遗忘：过期后又过了清理期
+    forgotten  遗忘：删除前的最后状态
     """
 
     CANDIDATE = "candidate"
     ACTIVE = "active"
     DORMANT = "dormant"
+    ARCHIVED = "archived"
     DROPPED = "dropped"
     EXPIRED = "expired"
     FORGOTTEN = "forgotten"

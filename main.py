@@ -194,10 +194,11 @@ class LingguangMemory(Star):
     async def _maintain(self) -> None:
         if self.store is None or self.conv is None:
             return
-        # 1. 过期与清理
+        # 1. 生命周期：暂存 → 待定 / 正式 → 遗忘库 / 遗忘库 → 真删
         try:
             await self.store.expire_stale()
             await self.store.purge_dormant()
+            await self.store.purge_archived()
         except Exception as e:
             logger.warning(f"[human_like_mem] 生命周期处理失败: {e!r}")
         # 2. 给新记忆补向量（语义检索开着才做）

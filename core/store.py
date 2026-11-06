@@ -250,6 +250,66 @@ class MemoryStore:
         topic = (atom.topic or "").strip() or "misc"
         return f"p:{who}:{topic}:{day}"
 
+    async def _recover_from_archive(self, db, atom: Atom) -> int:
+        """同一件事又被提起了：从遗忘库把它拉回来。
+
+        返回被拉起的 atom_id（0 = 没有相似的）。拉起来之后回到暂存区，
+        重新走一遍「定性 → 转正」，而不是直接恢复成正式记忆——
+        因为这次提起的语境可能不一样了。
+        """
+        if not bool(self.config.get("recover_on_repeat", True)):
+            return 0
+        frags = self._fragments(atom.content, max_pieces=5)
+        if not frags:
+            return 0
+        conds = " OR ".join("content LIKE ?" for _ in frags)
+        try:
+            cursor = await db.execute(
+                f"SELECT id, content FROM atoms WHERE status = ? AND ({conds}) LIMIT 80",
+                [AtomStatus.ARCHIVED.value, *[f"%{f}%" for f in frags]],
+            )
+            rows = await cursor.fetchall()
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 查遗忘库失败: {e!r}")
+            return 0
+
+        best_id, best = 0, 0.0
+        for row in rows:
+            score = _similar(atom.content, str(row["content"] or ""))
+            if score > best:
+                best_id, best = int(row["id"]), score
+        # 遗忘库的拉起阈值要比暂存区宽松：隔了很久的事，说法肯定不一样
+        # （「养过一只叫小黑的狗」vs「养的那只狗叫小黑」）
+        threshold = self.recover_threshold
+        if not best_id or best < threshold:
+            return 0
+
+        now = time.time()
+        try:
+            await db.execute(
+                "UPDATE atoms SET status = ?, expires_at = ?, "
+                "reinforce_count = reinforce_count + 1, last_reinforce = ?, "
+                "last_access = ?, "
+                "metadata = json_set(COALESCE(metadata,'{}'), '$.recovered_at', ?) "
+                "WHERE id = ?",
+                (
+                    AtomStatus.CANDIDATE.value,
+                    now + self.staging_ttl_days * 86400.0,
+                    now,
+                    now,
+                    now,
+                    best_id,
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 拉起遗忘记忆失败: {e!r}")
+            return 0
+        logger.info(
+            f"[human_like_mem] 同一件事又被提起(相似 {best:.2f})，从遗忘库拉起 #{best_id}: "
+            f"{atom.content[:40]}"
+        )
+        return best_id
+
     async def add_atoms(self, atoms: list[Atom], enable_dedup: bool = True) -> list[int]:
         """批量写原子。会做三件事：丢弃低价值、暂存区查重、定 TTL。"""
         if not atoms:
@@ -279,6 +339,12 @@ class MemoryStore:
                         logger.info(
                             f"[human_like_mem] 暂存命中(相似 {hit[1]:.2f})，强化不新建: {atom.content[:30]}"
                         )
+                        continue
+                    # 暂存区没有 → 看看是不是遗忘库里躺着的旧事
+                    recovered = await self._recover_from_archive(db, atom)
+                    if recovered:
+                        atom.atom_id = recovered
+                        ids.append(recovered)
                         continue
 
                 atom.partition_key = atom.partition_key or await self._resolve_partition(db, atom)
@@ -578,24 +644,71 @@ class MemoryStore:
     # ---------- 生命周期 ----------
 
     async def expire_stale(self) -> dict[str, int]:
-        """暂存到期 → 待定；正式到期 → 过期。"""
+        """生命周期推进。
+
+        - 暂存到期没定性 → 待定（dormant）
+        - 正式记忆到期      → 沉入遗忘库（archived），不检索，但会被再次提起唤醒
+        """
         now = time.time()
         keep = self.dormant_keep_days
+        archive_keep = self.archive_keep_days
         async with self._connect() as db:
             c1 = await db.execute(
                 "UPDATE atoms SET status = ?, expires_at = ? WHERE status = ? AND expires_at < ?",
                 (AtomStatus.DORMANT.value, now + keep * 86400.0,
                  AtomStatus.CANDIDATE.value, now),
             )
+            # 正式记忆到期 → 遗忘库，给一个新的「彻底删掉」的期限
             c2 = await db.execute(
-                "UPDATE atoms SET status = ? WHERE status = ? AND expires_at < ?",
-                (AtomStatus.EXPIRED.value, AtomStatus.ACTIVE.value, now),
+                "UPDATE atoms SET status = ?, expires_at = ?, "
+                "metadata = json_set(COALESCE(metadata,'{}'), '$.archived_at', ?) "
+                "WHERE status = ? AND expires_at < ?",
+                (AtomStatus.ARCHIVED.value, now + archive_keep * 86400.0,
+                 now, AtomStatus.ACTIVE.value, now),
             )
             await db.commit()
             n1, n2 = c1.rowcount, c2.rowcount
         if n1:
             logger.info(f"[human_like_mem] {n1} 条暂存转待定（{keep:.0f} 天后删）")
-        return {"dormant": n1, "expired": n2}
+        if n2:
+            logger.info(f"[human_like_mem] {n2} 条正式记忆沉入遗忘库（{archive_keep:.0f} 天后真删）")
+        return {"dormant": n1, "archived": n2}
+
+    @property
+    def archive_keep_days(self) -> float:
+        """遗忘库保留多少天（之后彻底删掉）。"""
+        raw = self.config.get("archive_keep_days", 180)
+        return 180.0 if raw is None else float(raw)
+
+    @property
+    def recover_threshold(self) -> float:
+        """遗忘库拉起阈值。比暂存区查重宽松：隔了很久的说法差别大。"""
+        raw = self.config.get("recover_similarity_threshold", 0.62)
+        return 0.62 if raw is None else float(raw)
+
+    async def purge_archived(self) -> int:
+        """遗忘库放太久的，彻底删掉。"""
+        now = time.time()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT id FROM atoms WHERE status = ? AND expires_at < ?",
+                (AtomStatus.ARCHIVED.value, now),
+            )
+            rows = await cursor.fetchall()
+            ids = [int(r["id"]) for r in rows]
+            if ids:
+                ph = ",".join("?" * len(ids))
+                await db.execute(f"DELETE FROM atoms_fts WHERE atom_id IN ({ph})", ids)
+                await db.execute(f"DELETE FROM atoms WHERE id IN ({ph})", ids)
+                # 向量表可能没建（没开语义检索时不存在）
+                try:
+                    await db.execute(f"DELETE FROM atom_vectors WHERE atom_id IN ({ph})", ids)
+                except Exception:
+                    pass
+                await db.commit()
+        if ids:
+            logger.info(f"[human_like_mem] 遗忘库清理 {len(ids)} 条")
+        return len(ids)
 
     async def purge_dormant(self) -> int:
         """待定超过保留期 → 真删。"""

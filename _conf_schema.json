@@ -154,5 +154,23 @@
     "hint": "默认 bge-m3（1024 维）",
     "type": "string",
     "default": "bge-m3"
+  },
+  "archive_keep_days": {
+    "description": "遗忘库保留天数",
+    "hint": "正式记忆放久了会沉进遗忘库（不参与检索），保留这么多天后彻底删掉。默认 180 天。",
+    "type": "int",
+    "default": 180
+  },
+  "recover_on_repeat": {
+    "description": "遗忘的记忆被再次提及时拉起",
+    "hint": "同一件事又被提起时，从遗忘库拉回来重新走定性。关掉就永远不拉。",
+    "type": "bool",
+    "default": true
+  },
+  "recover_similarity_threshold": {
+    "description": "遗忘库拉起相似度阈值",
+    "hint": "同一件事又被提起时，相似度达到多少才从遗忘库拉回来。比暂存区查重宽松，因为隔久了说法不一样。默认 0.62。",
+    "type": "float",
+    "default": 0.62
   }
 }
