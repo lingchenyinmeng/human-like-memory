@@ -1,5 +1,35 @@
 # 更新记录
 
+## 1.3.0 (2026-11-06)
+
+新增**管理面板**。
+
+装好之后在 AstrBot 后台「插件 → Human-like Memory → 视图」打开。
+
+### 能看到
+
+- 顶部统计：记忆条数、原子总数、各状态数量、平均重要性、语义检索是否开启
+- 筛选：按状态 / 类型 / 关键词
+- 列表：内容、状态、类型、谁对谁、性质、隐私标记、说话人、重要性、时间
+- 详情：完整字段 + 上文（最近 2 条原文）+ 分区 + TTL + 强化次数
+
+### 状态色条
+
+列表左侧一条颜色区分状态：绿=正式、蓝=暂存、黄=待定、紫=遗忘库、灰=过期。
+
+### 三个接口
+
+```
+GET /api/plug/astrbot_plugin_human_like_memory/page/stats
+GET /api/plug/astrbot_plugin_human_like_memory/page/atoms
+GET /api/plug/astrbot_plugin_human_like_memory/page/atom?id=
+```
+
+### 实现
+
+- 页面：`views/dashboard/`（index.html + app.js + style.css，纯原生，无构建）
+- 后端：`core/page_api.py`，用 `context.register_web_api` 注册
+- 页面通过 AstrBot 的 plugin page bridge SDK 调接口
 ## 1.2.0 (2026-11-06)
 
 新增**遗忘库**（第三层记忆）。

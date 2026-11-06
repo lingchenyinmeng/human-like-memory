@@ -118,6 +118,16 @@ class LingguangMemory(Star):
         # 语义检索（可选）：装了 Ollama + bge-m3 且建过索引才启用
         await self._init_semantic()
 
+        # 面板 API（页面在 views/dashboard/）
+        try:
+            from .core.page_api import PageApi
+
+            self.page_api = PageApi(self)
+            self.page_api.register_routes()
+            logger.info("[human_like_mem] 面板 API 已注册")
+        except Exception as e:
+            logger.warning(f"[human_like_mem] 面板 API 注册失败（不影响记忆功能）: {e!r}")
+
         self._loop_task = asyncio.create_task(self._loop(), name="lingguang-mem-loop")
         logger.info(
             f"[human_like_mem] 已启动 | 库: {self.memory_db} | "
