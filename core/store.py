@@ -96,6 +96,48 @@ class MemoryStore:
     def promote_min_conf(self) -> float:
         return float(self.config.get("promote_min_confidence", 0.8) or 0.8)
 
+    @property
+    def promote_by_importance(self) -> float:
+        """重要性到这个值，不用等定性也能转正。"""
+        raw = self.config.get("promote_by_importance", 0.65)
+        return 0.65 if raw is None else float(raw)
+
+    @property
+    def promote_fact_conf(self) -> float:
+        """陈述/承诺类专用的低门槛。
+
+        fact 是「一件事发生了」，本来就不需要判「是玩笑还是真骂」。
+        硬要求它跟 joke/scold 一样到 0.8，等于让陈述句先证明自己是陈述句——
+        这就是大部分记忆永远转不正的原因。
+        """
+        raw = self.config.get("promote_fact_confidence", 0.55)
+        return 0.55 if raw is None else float(raw)
+
+    def should_promote(
+        self,
+        *,
+        mtype: str,
+        nature_conf: float,
+        importance: float,
+        reinforce_count: int,
+        nature: str = "",
+    ) -> bool:
+        """能不能从暂存区转正。四个口子，任一满足。"""
+        # ① 被反复提到
+        if reinforce_count >= self.promote_min_reinforce:
+            return True
+        # ② 定性够确定
+        if nature_conf >= self.promote_min_conf:
+            return True
+        # ③ 陈述 / 承诺 / 夸奖类：不靠"判性质"也能进
+        #    夸奖只是记下一句好话，判错代价很小，没必要跟"真骂"用同一个门槛
+        if mtype in ("fact", "promise", "praise") and nature_conf >= self.promote_fact_conf:
+            return True
+        # ④ 事情本身重要
+        if float(importance or 0) >= self.promote_by_importance:
+            return True
+        return False
+
     # ---------- 连接 ----------
 
     @asynccontextmanager
@@ -392,7 +434,24 @@ class MemoryStore:
 
                 atom.partition_key = atom.partition_key or await self._resolve_partition(db, atom)
                 if self.staging_enabled and atom.status == AtomStatus.CANDIDATE.value:
-                    atom.ttl_days = self.staging_ttl_days
+                    # 写入时就判一次能不能转正：
+                    # 重要的事、陈述/承诺类、定性确定的，不该在暂存区干等着——
+                    # 大部分话这辈子只说一次，等不到"被提第二遍"。
+                    if self.should_promote(
+                        mtype=str(atom.mtype or ""),
+                        nature_conf=float(atom.nature_conf or 0),
+                        importance=float(atom.importance or 0),
+                        reinforce_count=0,
+                        nature=str(atom.nature or ""),
+                    ):
+                        atom.status = AtomStatus.ACTIVE.value
+                        atom.ttl_days = atom.compute_ttl()
+                        logger.debug(
+                            f"[human_like_mem] 入段即转正（{atom.mtype} "
+                            f"重要性 {atom.importance:.2f}）：{atom.content[:30]}"
+                        )
+                    else:
+                        atom.ttl_days = self.staging_ttl_days
                 else:
                     atom.ttl_days = atom.compute_ttl()
                 atom.expires_at = now + atom.ttl_days * 86400.0
@@ -438,11 +497,22 @@ class MemoryStore:
         return ids
 
     async def _find_similar(self, db, atom: Atom) -> tuple[int, float] | None:
-        """在暂存区里找相似的原子。"""
+        """找相似的已有原子。
+
+        以前只在**暂存区**里找，结果「重复转正」这条路从没跑起来过——
+        因为写入时常常直接转正了，它就不在暂存区了，下一句类似的话找不到它。
+        现在 candidate 和 active 都找（只查最近 90 天，避免全库扫）。
+        """
         cursor = await db.execute(
-            "SELECT id, content FROM atoms WHERE status = ? AND session_id = ? "
-            "ORDER BY create_time DESC LIMIT 40",
-            (AtomStatus.CANDIDATE.value, atom.session_id),
+            "SELECT id, content FROM atoms "
+            "WHERE status IN (?, ?) AND session_id = ? AND create_time > ? "
+            "ORDER BY create_time DESC LIMIT 60",
+            (
+                AtomStatus.CANDIDATE.value,
+                AtomStatus.ACTIVE.value,
+                atom.session_id,
+                time.time() - 90 * 86400.0,
+            ),
         )
         rows = await cursor.fetchall()
         best_id, best = 0, 0.0
@@ -454,30 +524,80 @@ class MemoryStore:
             return best_id, best
         return None
 
+    async def promote_candidates(self, limit: int = 300) -> int:
+        """定时重判：扫一遍暂存区，够条件的转正。
+
+        以前 candidate 只在两个时刻有转正机会：
+          1. 刚写入时瞬判一次
+          2. 被同一件事再次提起
+        大部分话这辈子只说一次，所以会一直卡着干等到期（48 小时→待定）。
+        维护循环里定期扫一遍就不会卡了。
+        """
+        now = time.time()
+        promoted = 0
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT id, mtype, nature, nature_conf, importance, reinforce_count "
+                "FROM atoms WHERE status = ? LIMIT ?",
+                (AtomStatus.CANDIDATE.value, max(1, int(limit))),
+            )
+            rows = await cursor.fetchall()
+            for r in rows:
+                if not self.should_promote(
+                    mtype=str(r["mtype"] or ""),
+                    nature_conf=float(r["nature_conf"] or 0),
+                    importance=float(r["importance"] or 0),
+                    reinforce_count=int(r["reinforce_count"] or 0),
+                    nature=str(r["nature"] or ""),
+                ):
+                    continue
+                from .models import BASE_TTL
+
+                base = BASE_TTL.get(str(r["mtype"] or "unknown"), 30)
+                imp = float(r["importance"] or 0.5)
+                ttl = max(1.0, base * (0.5 + imp))
+                await db.execute(
+                    "UPDATE atoms SET status = ?, ttl_days = ?, expires_at = ? WHERE id = ?",
+                    (AtomStatus.ACTIVE.value, ttl, now + ttl * 86400.0, int(r["id"])),
+                )
+                promoted += 1
+            if promoted:
+                await db.commit()
+        if promoted:
+            logger.info(f"[human_like_mem] 定时重判：{promoted} 条暂存转正")
+        return promoted
+
     async def _reinforce(self, db, atom_id: int, new_conf: float = 0.0) -> None:
         """强化一条原子；够条件就转正。"""
         now = time.time()
         cursor = await db.execute(
-            "SELECT reinforcement_count, confidence, atom_type, mtype, importance, "
+            "SELECT reinforce_count, mtype, importance, "
             "status, nature, nature_conf FROM atoms WHERE id = ?",
             (atom_id,),
         )
         row = await cursor.fetchone()
         if not row:
             return
-        count = int(row["reinforcement_count"]) + 1
+        count = int(row["reinforce_count"] or 0) + 1
         conf = float(row["nature_conf"] or 0)
         if new_conf:
             conf = conf * 0.7 + new_conf * 0.3
         status = str(row["status"] or "")
         nature = str(row["nature"] or "")
         if status == AtomStatus.CANDIDATE.value:
-            promote = count >= self.promote_min_reinforce or (
-                nature and nature != "joke_guess" and conf >= self.promote_min_conf
+            promote = self.should_promote(
+                mtype=str(row["mtype"] or ""),
+                nature_conf=conf,
+                importance=float(row["importance"] or 0),
+                reinforce_count=count,
+                nature=nature,
             )
             if promote:
                 status = AtomStatus.ACTIVE.value
-                logger.info(f"[human_like_mem] 暂存转正(次数 {count}, 置信 {conf:.2f})")
+                logger.info(
+                    f"[human_like_mem] 暂存转正(次数 {count}, 置信 {conf:.2f}, "
+                    f"类型 {row['mtype']}, 重要性 {row['importance']:.2f})"
+                )
         if status == AtomStatus.CANDIDATE.value:
             ttl = self.staging_ttl_days
         else:
@@ -487,7 +607,7 @@ class MemoryStore:
             imp = float(row["importance"] or 0.5)
             ttl = max(1.0, base * (0.5 + imp) * (1 + min(0.5, count * 0.1)))
         await db.execute(
-            "UPDATE atoms SET reinforcement_count = ?, nature_conf = ?, status = ?, "
+            "UPDATE atoms SET reinforce_count = ?, nature_conf = ?, status = ?, "
             "ttl_days = ?, expires_at = ?, last_reinforce = ? WHERE id = ?",
             (count, conf, status, ttl, now + ttl * 86400.0, now, atom_id),
         )

@@ -184,5 +184,17 @@
     "hint": "多久没出现就归档（依然保留，不删）。默认 90 天。",
     "type": "int",
     "default": 90
+  },
+  "promote_by_importance": {
+    "description": "重要性到这个值直接转正",
+    "hint": "不用等定性，重要的事该记就记。默认 0.65。",
+    "type": "float",
+    "default": 0.65
+  },
+  "promote_fact_confidence": {
+    "description": "陈述/承诺类的转正门槛",
+    "hint": "事实不需要判「是玩笑还是真骂」，所以门槛比态度类低。默认 0.55。",
+    "type": "float",
+    "default": 0.55
   }
 }

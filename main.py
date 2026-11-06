@@ -232,6 +232,11 @@ class LingguangMemory(Star):
                 )
         except Exception as e:
             logger.debug(f"[human_like_mem] 人原子衰减失败: {e!r}")
+        # 1.8 定时重判暂存区：够条件就转正，别让它干等到期
+        try:
+            await self.store.promote_candidates()
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 定时重判失败: {e!r}")
         # 2. 给新记忆补向量（语义检索开着才做）
         try:
             await self._index_missing_vectors()

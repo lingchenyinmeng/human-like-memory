@@ -96,4 +96,35 @@ def apply_history(
     return nature, conf, ""
 
 
-__all__ = ["RULES", "NATURE_CN", "classify_nature", "to_tier", "apply_history"]
+__all__ = ["RULES", "NATURE_CN", "MTYPE_NATURE", "classify_nature", "resolve_nature", "to_tier", "apply_history"]
+
+# mtype → nature 基调（mtype 是"在说什么"，nature 是"什么语气"）
+MTYPE_NATURE: dict[str, str] = {
+    "praise": "praise",    # 夸奖
+    "blame": "scold",      # 批评 → 先按真骂，正则会细分
+    "command": "request",  # 命令 → 嘱托
+    "promise": "request",  # 承诺 → 嘱托
+    "emotion": "emotion",
+    "request": "question",
+    "fact": "fact",
+    "smalltalk": "fact",
+}
+
+
+def resolve_nature(mtype: str, text: str) -> tuple[str, float]:
+    """定性质：先按 mtype 定基调，再让正则细化语气。
+
+    这样 mtype=praise 的话不会再被判成「陈述句」——
+    以前两套正则各跑各的，必然打架。
+    """
+    base = MTYPE_NATURE.get(str(mtype or ""), "fact")
+    raw, conf = classify_nature(text)
+
+    # 「玩笑」是语气，可以盖过任何基调：夸奖也能是玩笑
+    if raw == "joke" and conf >= 0.70:
+        return "joke", conf
+    # 「真骂」也是语气
+    if raw == "scold" and conf >= 0.75:
+        return "scold", conf
+    # 其余情况：用 mtype 定的基调，置信度至少 0.72（够转正门槛）
+    return base, max(conf, 0.72)

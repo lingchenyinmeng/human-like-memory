@@ -10,15 +10,15 @@ import time
 from typing import Any
 
 from .models import Atom, AtomStatus, MType
-from .nature import apply_history, classify_nature, to_tier
+from .nature import apply_history, classify_nature, resolve_nature, to_tier
 
 # ---------- 关键词表 ----------
 
-_CMD = r"去|帮我|给我|马上|现在|立刻|不许|不准|别|以后|每次|记得|要一直|改成|教|学会"
+_CMD = r"去|帮我|给我|马上|现在|立刻|不许|不准|别|以后|每次|记得|要一直|改成|教|学会|要求|让我|叫我|喊我|吩咐|叮嘱"
 _PROMISE = r"答应|承诺|约定|说好|一定|我会|保证"
 _PRAISE = r"可爱|厉害|聪明|好看|不错|挺好|棒|优秀|喜欢|真行|靠谱|夸"
 _BLAME = r"蠢|笨|傻|烦|啰嗦|话多|点偏|错了|不行|没用|废物|滚|嫌|骂"
-_EMOTION = r"累|难过|开心|烦|委屈|生气|害怕|想哭|难受|高兴|崩溃"
+_EMOTION = r"累|困|难过|开心|烦|委屈|生气|害怕|想哭|难受|高兴|崩溃|爽"
 _REQUEST = r"能不能|可不可以|帮我|请问|怎么办|要不要|吗[？?]?$|呢[？?]?$|为什么|是不是"
 _SMALLTALK = r"^哈|^嗯|^哦|^在吗|^早|^晚|吃了|睡了|天气|晚安"
 
@@ -188,8 +188,8 @@ def build_atoms(
             who_name=who_name, source=source, identities=identities,
         )
 
-        # 定性
-        raw_nature, raw_conf = classify_nature(fact)
+        # 定性：按 mtype 定基调，正则只细化语气（避免两套规则打架）
+        raw_nature, raw_conf = resolve_nature(mtype, fact)
         nature, nconf, nsrc = apply_history(raw_nature, raw_conf, history or [])
         final_nature, tier_src, need_ask = to_tier(nature, nconf)
         if nsrc:
