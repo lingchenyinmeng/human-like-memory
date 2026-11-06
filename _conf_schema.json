@@ -1,0 +1,140 @@
+{
+  "owner_qq": {
+    "description": "主人 QQ",
+    "hint": "留空自动取 AstrBot 全局管理员",
+    "type": "string",
+    "default": ""
+  },
+  "inject_enabled": {
+    "description": "注入记忆到对话",
+    "hint": "关闭后不再往上下文里塞记忆",
+    "type": "bool",
+    "default": true
+  },
+  "inject_max_chars": {
+    "description": "注入字数上限",
+    "hint": "注入文本最多多少字，默认 400",
+    "type": "int",
+    "default": 400
+  },
+  "hot_memory_count": {
+    "description": "热记忆条数",
+    "hint": "最近 48 小时内的记忆固定注入几条，默认 3",
+    "type": "int",
+    "default": 3
+  },
+  "recall_top_k": {
+    "description": "检索条数",
+    "hint": "按关键词检索时最多返回几条，默认 5",
+    "type": "int",
+    "default": 5
+  },
+  "summary_trigger_messages": {
+    "description": "多少条消息触发总结",
+    "hint": "一个会话积攒多少条未总结消息后生成记忆，默认 30",
+    "type": "int",
+    "default": 30
+  },
+  "maintain_interval_minutes": {
+    "description": "维护间隔（分钟）",
+    "hint": "多久跑一次过期清理和问主人，默认 10",
+    "type": "int",
+    "default": 10
+  },
+  "startup_delay_seconds": {
+    "description": "启动延迟（秒）",
+    "hint": "插件启动后等多久再开始维护，默认 90",
+    "type": "int",
+    "default": 90
+  },
+  "staging_enabled": {
+    "description": "启用短时暂存",
+    "hint": "新记忆先落暂存区，重复提到或定性明确才转正式库",
+    "type": "bool",
+    "default": true
+  },
+  "staging_ttl_hours": {
+    "description": "暂存存活小时数",
+    "hint": "暂存记忆超过这个时间没转正就转「待定」，默认 48",
+    "type": "int",
+    "default": 48
+  },
+  "staging_similarity_threshold": {
+    "description": "暂存查重阈值",
+    "hint": "同一件事换个说法也要能合并，默认 0.85",
+    "type": "float",
+    "default": 0.85
+  },
+  "staging_recall_penalty": {
+    "description": "暂存召回降权",
+    "hint": "暂存记忆被召回时乘这个系数，默认 0.5",
+    "type": "float",
+    "default": 0.5
+  },
+  "importance_drop_threshold": {
+    "description": "重要性丢弃阈值",
+    "hint": "低于这个值直接不记，默认 0.3",
+    "type": "float",
+    "default": 0.3
+  },
+  "dormant_keep_days": {
+    "description": "待定保留天数",
+    "hint": "到期没定性的记忆转待定，保留这么多天后真删，默认 7",
+    "type": "int",
+    "default": 7
+  },
+  "promote_min_reinforce": {
+    "description": "重复几次算定性",
+    "hint": "同一件事被提到这个次数后转正式记忆，默认 2",
+    "type": "int",
+    "default": 2
+  },
+  "promote_min_confidence": {
+    "description": "置信度多少直接转正",
+    "hint": "分类明确且置信度够高时不用等重复，默认 0.8",
+    "type": "float",
+    "default": 0.8
+  },
+  "group_partition_gap_minutes": {
+    "description": "群聊分区间隔（分钟）",
+    "hint": "同一个人在群里连着说话，间隔小于这个数算同一个分区，默认 15",
+    "type": "int",
+    "default": 15
+  },
+  "backfill_enabled": {
+    "description": "启用回溯比对",
+    "hint": "定性时查同一个人以前说过类似的话，作为参考",
+    "type": "bool",
+    "default": true
+  },
+  "backfill_lookback_days": {
+    "description": "回溯范围（天）",
+    "hint": "往回看多少天的历史，默认 30",
+    "type": "int",
+    "default": 30
+  },
+  "ask_cooldown_minutes": {
+    "description": "问主人冷却（分钟）",
+    "hint": "两次询问至少间隔多久，默认 10",
+    "type": "int",
+    "default": 10
+  },
+  "ask_max_per_time": {
+    "description": "单次最多问几条",
+    "hint": "攒成一条消息一次问清，默认 5",
+    "type": "int",
+    "default": 5
+  },
+  "context_messages": {
+    "description": "上文条数",
+    "hint": "记忆带多少条上文，默认 2",
+    "type": "int",
+    "default": 2
+  },
+  "context_max_chars": {
+    "description": "上文单条字数上限",
+    "hint": "每条上文截多少字，默认 100",
+    "type": "int",
+    "default": 100
+  }
+}
