@@ -144,6 +144,9 @@ class Atom:
     # 来源与上下文
     who_id: str = ""
     who_name: str = ""
+    # 这条事件牵扯到哪些人（人库里的 person_id，不写名字）
+    # 一条事件可以同时挂好几个人；反查时靠这些 id 跳进人表
+    person_ids: list[str] = field(default_factory=list)
     said_at: float = 0.0
     context: list[dict] = field(default_factory=list)
     source: str = ""          # group / private

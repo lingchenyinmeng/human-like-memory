@@ -172,5 +172,17 @@
     "hint": "同一件事又被提起时，相似度达到多少才从遗忘库拉回来。比暂存区查重宽松，因为隔久了说法不一样。默认 0.62。",
     "type": "float",
     "default": 0.62
+  },
+  "people_quiet_days": {
+    "description": "人原子转「安静」的天数",
+    "hint": "多久没出现就把这个人标成安静（还在库里，只是不活跃）。默认 7 天。",
+    "type": "int",
+    "default": 7
+  },
+  "people_archive_days": {
+    "description": "人原子转「归档」的天数",
+    "hint": "多久没出现就归档（依然保留，不删）。默认 90 天。",
+    "type": "int",
+    "default": 90
   }
 }

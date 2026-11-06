@@ -5,6 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Human-like Memory</title>
   <link rel="stylesheet" href="./style.css" />
+  <script>
+    /* AstrBot 的页面桥接 SDK 需要自己引：从 URL 的 /_t/<token> 取 asset_token */
+    (function () {
+      var m = (location.pathname || "").match(/\/_t\/([^\/]+)/);
+      var token = m ? m[1] : "";
+      var s = document.createElement("script");
+      s.src = "/api/v1/plugins/page-bridge-sdk.js?asset_token=" + encodeURIComponent(token);
+      s.async = false;
+      document.head.appendChild(s);
+    })();
+  </script>
 </head>
 <body>
   <div class="wrap">
@@ -12,54 +23,84 @@
       <div class="brand">
         <span class="dot"></span>
         <h1>Human-like Memory</h1>
-        <span class="ver" id="semanticBadge"></span>
+        <span class="badge" id="badge">加载中</span>
       </div>
       <button class="ghost" id="refreshBtn">刷新</button>
     </header>
 
     <section class="stats" id="stats"></section>
 
-    <section class="filters">
-      <select id="fStatus">
-        <option value="">全部状态</option>
-        <option value="candidate">暂存</option>
-        <option value="active">正式</option>
-        <option value="dormant">待定</option>
-        <option value="archived">遗忘库</option>
-        <option value="expired">过期</option>
-      </select>
-      <select id="fType">
-        <option value="">全部类型</option>
-        <option value="command">命令</option>
-        <option value="promise">承诺</option>
-        <option value="praise">夸奖</option>
-        <option value="blame">批评</option>
-        <option value="fact">事实</option>
-        <option value="emotion">情绪</option>
-        <option value="request">提问</option>
-        <option value="smalltalk">闲聊</option>
-      </select>
-      <input id="fQ" type="search" placeholder="搜内容…" />
-      <button class="primary" id="searchBtn">查找</button>
+    <nav class="tabs" id="tabs">
+      <button data-tab="memories" class="on">记忆 <em id="cntMem">0</em></button>
+      <button data-tab="people">人物 <em id="cntPpl">0</em></button>
+      <button data-tab="relations">关系 <em id="cntRel">0</em></button>
+    </nav>
+
+    <!-- 记忆 -->
+    <section class="view" id="view-memories">
+      <div class="filters">
+        <select id="fStatus">
+          <option value="">全部状态</option>
+          <option value="candidate">暂存</option>
+          <option value="active">正式</option>
+          <option value="dormant">待定</option>
+          <option value="archived">遗忘库</option>
+          <option value="expired">过期</option>
+        </select>
+        <select id="fType">
+          <option value="">全部类型</option>
+          <option value="command">命令</option>
+          <option value="promise">承诺</option>
+          <option value="praise">夸奖</option>
+          <option value="blame">批评</option>
+          <option value="fact">事实</option>
+          <option value="emotion">情绪</option>
+          <option value="request">提问</option>
+          <option value="smalltalk">闲聊</option>
+        </select>
+        <input id="fQ" type="search" placeholder="搜内容…" />
+        <button class="primary" id="searchBtn">查找</button>
+      </div>
+      <div class="list" id="list"></div>
+      <nav class="pager" id="pager"></nav>
     </section>
 
-    <section class="list" id="list"></section>
+    <!-- 人物 -->
+    <section class="view" id="view-people" hidden>
+      <div class="filters">
+        <select id="pStatus">
+          <option value="">全部状态</option>
+          <option value="active">活跃</option>
+          <option value="quiet">安静</option>
+          <option value="archived">归档</option>
+        </select>
+        <input id="pQ" type="search" placeholder="搜名字 / QQ…" />
+        <button class="primary" id="pSearchBtn">查找</button>
+      </div>
+      <div class="people" id="peopleList"></div>
+      <nav class="pager" id="ppager"></nav>
+    </section>
 
-    <nav class="pager" id="pager"></nav>
+    <!-- 关系 -->
+    <section class="view" id="view-relations" hidden>
+      <div class="graph-wrap">
+        <canvas id="graph" width="1100" height="520"></canvas>
+        <div class="graph-hint" id="graphHint">选一个人看他的关系网</div>
+      </div>
+      <div class="rel-list" id="relList"></div>
+    </section>
 
     <div class="detail-mask" id="mask">
       <div class="detail">
         <header>
-          <h2 id="dTitle">记忆详情</h2>
+          <h2 id="dTitle">详情</h2>
           <button class="ghost" id="closeBtn">关闭</button>
         </header>
         <div id="dBody"></div>
       </div>
     </div>
 
-    <footer class="foot">
-      <span id="footHint">加载中…</span>
-    </footer>
+    <footer class="foot"><span id="footHint">加载中…</span></footer>
   </div>
   <script src="./app.js"></script>
 </body>

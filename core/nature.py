@@ -14,9 +14,9 @@ import re
 # (nature, 正则, 基础置信度)，顺序即优先级（越靠前越优先）
 RULES: list[tuple[str, str, float]] = [
     ("scold", r"傻[逼b屄]|蠢货|废物|滚蛋|滚开|没用的东西|恶心|垃圾|白痴|智障|你特么", 0.82),
-    ("request", r"以后|每次|记得|别忘了|不许|不准|要一直|从现在起|帮我|给我|必须|一定要", 0.78),
+    ("request", r"以后|每次|记得|别忘了|不许|不准|要一直|从现在起|帮我|给我|必须|一定要|要求|让我|叫我|喊我|吩咐|叮嘱|别用|改成|缩句|省略", 0.78),
     ("joke", r"哈哈|233|笑死|逗你|开玩笑|狗头|😂|🤣|😆|你猜|真的假的|绝了|离谱|草(?![莓])", 0.75),
-    ("emotion", r"好累|难过|想哭|难受|委屈|生气|高兴|害怕|开心|烦死|心累|崩溃", 0.72),
+    ("emotion", r"好累|难过|想哭|难受|委屈|生气|高兴|害怕|开心|烦死|心累|崩溃|困|累|爽", 0.72),
     ("question", r"[？?]|吗[。！!]*$|呢[。！!]*$|怎么|为什么|是不是|能不能|要不要|怎么办", 0.70),
 ]
 
@@ -59,11 +59,18 @@ def classify_nature(text: str) -> tuple[str, float]:
 
 
 def to_tier(nature: str, conf: float) -> tuple[str, str, bool]:
-    """映射成三档：(最终 nature, 来源标记, 是否要问主人)。"""
+    """映射成三档：(最终 nature, 来源标记, 是否要问主人)。
+
+    0.6–0.7 这一档只对「玩笑」改成 joke_guess（先按玩笑顶着），
+    别的类型保留原判断、只打 assume 标记——不能因为没把握就把
+    一句正经嘱托写成「多半是玩笑」。
+    """
     if conf >= 0.7:
         return nature, "rule", False
     if conf >= 0.6:
-        return "joke_guess", "assume", False
+        if nature == "joke":
+            return "joke_guess", "assume", False
+        return nature, "assume", False
     return "", "uncertain", True
 
 

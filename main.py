@@ -118,6 +118,18 @@ class LingguangMemory(Star):
         # 语义检索（可选）：装了 Ollama + bge-m3 且建过索引才启用
         await self._init_semantic()
 
+        # 人际关系库（跟事件库物理分开）
+        try:
+            from .core.people import PeopleStore
+
+            self.people_db_path = os.path.join(self.data_dir, "people.db")
+            self.people = PeopleStore(self.people_db_path)
+            await self.people.initialize()
+            logger.info(f"[human_like_mem] 人库已接上: {self.people_db_path}")
+        except Exception as e:
+            self.people = None
+            logger.warning(f"[human_like_mem] 人库初始化失败（不影响记忆功能）: {e!r}")
+
         # 面板 API（页面在 views/dashboard/）
         try:
             from .core.page_api import PageApi
@@ -211,6 +223,15 @@ class LingguangMemory(Star):
             await self.store.purge_archived()
         except Exception as e:
             logger.warning(f"[human_like_mem] 生命周期处理失败: {e!r}")
+        # 1.5 人原子也会冷下去（但不删，没关系的人依然在库里）
+        try:
+            if self.people is not None:
+                await self.people.decay_people(
+                    quiet_days=float(self.conf.get("people_quiet_days", 7) or 7),
+                    archive_days=float(self.conf.get("people_archive_days", 90) or 90),
+                )
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 人原子衰减失败: {e!r}")
         # 2. 给新记忆补向量（语义检索开着才做）
         try:
             await self._index_missing_vectors()
@@ -310,6 +331,8 @@ class LingguangMemory(Star):
             await self.store.add_memory(mem)
             atom_objs = await self._build_atoms_for(mem, msgs)
             if atom_objs:
+                # 挂 person_id：一条事件可能同时牵扯好几个人
+                await self._attach_person_ids(atom_objs, mem.participant_identities)
                 await self.store.add_atoms(atom_objs)
             await self.conv.mark_summarized(session_id, int(msgs[-1]["id"]))
             logger.info(
@@ -368,8 +391,145 @@ class LingguangMemory(Star):
             topic=",".join(mem.topics[:1]),
         )
 
+    async def _attach_person_ids(self, atoms: list[Atom], identities: list[dict]) -> None:
+        """给每条原子挂上人库里的 person_id（不写名字，只写 id）。"""
+        if not atoms or self.people is None:
+            return
+        # 先把这条记忆涉及的人都认一遍：QQ 优先，昵称其次
+        cache: dict[tuple[str, str], str] = {}
+
+        async def pid_for(qq: str, name: str) -> str:
+            key = (qq, name)
+            if key in cache:
+                return cache[key]
+            try:
+                pid = await self.people.resolve(
+                    qq=qq, name=name, create_if_missing=True, source="inferred"
+                )
+            except Exception as e:
+                logger.debug(f"[human_like_mem] 认人失败: {e!r}")
+                pid = ""
+            cache[key] = pid
+            return pid
+
+        # 记忆级参与者（一条事件可能牵扯好几个人）
+        ident_map: dict[str, str] = {}
+        for ident in identities or []:
+            if not isinstance(ident, dict):
+                continue
+            sid = str(ident.get("sender_id") or "").strip()
+            dname = str(ident.get("display_name") or "").strip()
+            if not sid and not dname:
+                continue
+            pid = await pid_for(sid, dname)
+            if pid:
+                for nm in (dname, *(ident.get("aliases") or [])):
+                    nm = str(nm or "").strip()
+                    if nm:
+                        ident_map[nm] = pid
+                ident_map[sid] = pid
+
+        for atom in atoms:
+            ids: list[str] = []
+            if atom.who_id or atom.who_name:
+                pid = await pid_for(atom.who_id, atom.who_name)
+                if pid:
+                    ids.append(pid)
+            # 正文里提到的人也算「在场」
+            for name, pid in ident_map.items():
+                if not name or len(name) < 2:
+                    continue
+                if name in atom.content and pid not in ids:
+                    ids.append(pid)
+            atom.person_ids = ids
+
     # ---------- 注入 ----------
 
+    # ---------- 检索路由：什么时候该补关系 ----------
+
+    _REL_HARD_WORDS = ("谁", "关系", "还算不算", "他现在是什么", "是什么关系", "什么人")
+
+    async def _maybe_relations(self, query: str, atoms: list[Atom]) -> str:
+        """按定的六条规则决定要不要查关系库，要查就顺手补上。
+
+        规则：
+          ① 问题里有「谁/关系/还算不算/他现在是什么」→ 硬规则，直接查
+          ② 同一个 person_id 出现 ≥2 次，且这些人最近 7 天有变动 → 查
+          ③ 事件结果全在同一话题、没有任何人际线索 → 查（防着"看起来够了"）
+          反向：事件结果里已经写明关系 → 跳过
+        """
+        if self.people is None or not atoms:
+            return ""
+        import re as _re
+
+        q = str(query or "")
+        reasons: list[str] = []
+
+        # 反向：正文里已经出现「是…的…」这种关系描述，就不用再查
+        if _re.search(r"是.{1,6}的(主人|朋友|家人|恋人|同事|同学|师父|徒弟)", " ".join(a.content for a in atoms)):
+            return ""
+
+        # ① 硬规则
+        if any(w in q for w in self._REL_HARD_WORDS):
+            reasons.append("问题里问了关系")
+
+        # 收集涉及的人
+        person_ids: list[str] = []
+        for a in atoms:
+            for pid in (a.person_ids or []):
+                if pid and pid not in person_ids:
+                    person_ids.append(pid)
+        if not person_ids:
+            return ""
+
+        # ② 同一个人出现多次 + 最近有变动
+        if not reasons:
+            from collections import Counter
+            cnt = Counter(pid for a in atoms for pid in (a.person_ids or []))
+            hot = [pid for pid, n in cnt.items() if n >= 2]
+            if hot:
+                week_ago = time.time() - 7 * 86400
+                try:
+                    for pid in hot[:3]:
+                        rels = await self.people.relations_of(pid)
+                        if any(float(r.get("updated_at") or 0) >= week_ago for r in rels):
+                            reasons.append("同一个人反复出现，且最近关系有变动")
+                            break
+                except Exception:
+                    pass
+
+        # ③ 全在同一话题、没人际线索
+        if not reasons:
+            topics = {a.topic for a in atoms if a.topic}
+            if len(topics) <= 1 and not any(a.layer in ("owner_to_other", "me_to_other", "other_to_other") for a in atoms):
+                reasons.append("结果全在同一话题，补一下人际线索")
+
+        if not reasons:
+            return ""
+
+        # 查这些人现在的关系
+        lines: list[str] = []
+        for pid in person_ids[:4]:
+            try:
+                card = await self.people.describe(pid)
+            except Exception:
+                continue
+            if not card.get("relations"):
+                continue
+            name = ""
+            for t in card.get("tags") or []:
+                if t.get("kind") in ("nickname", "real_name") and t.get("value"):
+                    name = str(t["value"])
+                    break
+            name = name or pid
+            for r in card["relations"][:3]:
+                other = r["b_id"] if r["a_id"] == pid else r["a_id"]
+                guess = "（我猜的）" if r.get("source") == "inferred" else ""
+                lines.append(f"- {name} 跟 {other} 是{r.get('rel_type')}{guess}")
+        if not lines:
+            return ""
+        logger.debug(f"[human_like_mem] 补关系（{reasons[0]}）")
+        return "[你记得的人际关系]\n" + "\n".join(lines[:6])
     @filter.on_llm_request()
     async def _inject(self, event: AstrMessageEvent, req: ProviderRequest):
         if self.store is None or self.injector is None:
@@ -402,9 +562,17 @@ class LingguangMemory(Star):
                 owner_id=self.owner_id,
                 max_chars=int(self.conf.get("inject_max_chars", 400) or 400),
             )
+            # 按六条规则决定要不要补人际关系
+            try:
+                rel_text = await self._maybe_relations(query, merged)
+            except Exception as e:
+                logger.debug(f"[human_like_mem] 补关系失败: {e!r}")
+                rel_text = ""
+            if rel_text:
+                text = (text + "\n" + rel_text) if text else rel_text
             if text:
-                from astrbot.api.message_components import Plain  # noqa: F401
-                from astrbot.core.message.components import TextPart
+                # TextPart 在 astrbot.core.agent.message，不在 core.message.components
+                from astrbot.core.agent.message import TextPart
 
                 req.extra_user_content_parts.append(
                     TextPart(text=text).mark_as_temp()
@@ -582,6 +750,110 @@ class LingguangMemory(Star):
         except Exception:
             pass
         return f"改好了：从「{target.nature or '未定性'}」改成「{n}」"
+
+    # ---------- 人际关系的工具 ----------
+
+    @filter.llm_tool(name="who_is")
+    async def who_is(self, event: AstrMessageEvent, name: str = "", qq: str = ""):
+        '''查一个人：他有哪些叫法、跟谁是什么关系。主人问「某某是谁」「他跟我什么关系」时用。
+
+        Args:
+            name(string): 名字/昵称/外号
+            qq(string): QQ 号（知道的话更准）
+        '''
+        if self.people is None:
+            return "人库还没准备好。"
+        try:
+            pid = await self.people.resolve(qq=qq, name=name, create_if_missing=False)
+            if not pid or str(pid).startswith("p_unk_"):
+                return f"我没认出来 {name or qq} 是谁。"
+            card = await self.people.describe(pid)
+            lines = [f"{name or qq}（{pid}）"]
+            if card["tags"]:
+                calls = "、".join(f"{t['value']}({t['kind']})" for t in card["tags"][:6])
+                lines.append(f"叫法：{calls}")
+            if card["relations"]:
+                lines.append("关系：")
+                for r in card["relations"][:8]:
+                    other = r["b_id"] if r["a_id"] == pid else r["a_id"]
+                    score = float(r.get("confidence") or 0)
+                    if r.get("source") == "inferred" or score < 0.5:
+                        tag = "（我猜的，没验证）"
+                    elif score < 0.9:
+                        tag = f"（只有一方说过 {score:.2f}）"
+                    else:
+                        tag = f"（多方印证 {score:.2f}）"
+                    lines.append(f"  - 跟 {other} 是{r['rel_type']}{tag}")
+            else:
+                lines.append("关系：还没记过")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"[human_like_mem] who_is 失败: {e!r}")
+            return "查人的时候出错了。"
+
+    @filter.llm_tool(name="relate")
+    async def relate(
+        self, event: AstrMessageEvent, a: str = "", b: str = "",
+        rel_type: str = "", said_by: str = "", guessed: bool = False, note: str = "",
+    ):
+        '''记两个人是什么关系。**单方说了不算定论**，要多方印证。
+
+        Args:
+            a(string): 一方（名字或 QQ 号）
+            b(string): 另一方
+            rel_type(string): 关系：家人/恋人/朋友/同事/同学/主仆/师徒/熟人/陌生人/敌对
+            said_by(string): 是谁说的（名字或 QQ 号）。留空 = 主人说的
+            guessed(bool): 是你自己推测出来的吗？是的话只当线索
+            note(string): 原话或备注
+        '''
+        if self.people is None:
+            return "人库还没准备好。"
+        valid = ("家人", "恋人", "朋友", "同事", "同学", "主仆", "师徒", "熟人", "陌生人", "敌对")
+        rt = str(rel_type or "").strip()
+        if rt not in valid:
+            return f"关系只能是：{'/'.join(valid)}"
+        if not a or not b:
+            return "要告诉我两个人分别是谁。"
+        try:
+            a_id = await self.people.resolve(name=str(a), create_if_missing=True)
+            b_id = await self.people.resolve(name=str(b), create_if_missing=True)
+            if not a_id or not b_id or a_id == b_id:
+                return "这两个人没分清，先不记。"
+
+            # 判断是谁说的 → 决定这条证据的分量
+            speaker = str(said_by or "").strip()
+            sender = str(event.get_sender_id() or "")
+            owner = self.owner_id
+            if guessed:
+                kind, speaker = "inferred", "self"
+            elif not speaker or speaker == owner or sender == owner:
+                kind, speaker = "owner", "owner"
+            else:
+                # 说的人是当事人之一吗？
+                pid = await self.people.resolve(name=speaker, create_if_missing=False)
+                kind = "party" if pid in (a_id, b_id) else "other"
+                speaker = pid or speaker
+
+            res = await self.people.verify_relation(
+                a_id, b_id, rt, speaker=speaker, speaker_kind=kind,
+                quote=str(note or ""),
+            )
+            if not res.get("ok"):
+                return f"没记上：{res.get('reason')}"
+
+            status_cn = {
+                "single": "只有一方说过，不算定论",
+                "confirmed": "多方印证",
+                "conflicted": "跟已有的说法矛盾，先存疑",
+            }.get(res["status"], res["status"])
+            return (
+                f"记下了：{a} 和 {b} 是{rt}。"
+                f"信任度 {res['confidence']}（{res['source_count']} 个来源，{status_cn}）"
+            )
+        except Exception as e:
+            logger.warning(f"[human_like_mem] relate 失败: {e!r}")
+            return "记关系的时候出错了。"
+
 
     @filter.llm_tool(name="memory_status")
     async def memory_status(self, event: AstrMessageEvent):

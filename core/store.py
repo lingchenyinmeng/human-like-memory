@@ -23,6 +23,19 @@ from astrbot.api import logger
 from .models import Atom, AtomStatus, Memory
 
 
+def _json_list(raw) -> list[str]:
+    """解析 JSON 数组字段，坏了就当空。"""
+    if isinstance(raw, list):
+        return [str(x) for x in raw if str(x).strip()]
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return [str(x) for x in data] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
 def _norm(text: str) -> str:
     """归一化用于查重：去掉空白和标点。"""
     s = str(text or "").strip().lower()
@@ -141,6 +154,7 @@ class MemoryStore:
                     nature_source TEXT DEFAULT '',
                     who_id TEXT DEFAULT '',
                     who_name TEXT DEFAULT '',
+                    person_ids TEXT DEFAULT '[]',
                     said_at REAL DEFAULT 0,
                     context TEXT DEFAULT '[]',
                     source TEXT DEFAULT '',
@@ -162,6 +176,35 @@ class MemoryStore:
                 )
                 """
             )
+            # 老库迁移：这些列是后来加上的，CREATE TABLE IF NOT EXISTS 不会补
+            _new_cols = {
+                "layer": "TEXT DEFAULT ''",
+                "mtype": "TEXT DEFAULT ''",
+                "subtype": "TEXT DEFAULT ''",
+                "classify_conf": "REAL DEFAULT 0",
+                "nature": "TEXT DEFAULT ''",
+                "nature_conf": "REAL DEFAULT 0",
+                "nature_source": "TEXT DEFAULT ''",
+                "who_id": "TEXT DEFAULT ''",
+                "who_name": "TEXT DEFAULT ''",
+                "person_ids": "TEXT DEFAULT '[]'",
+                "said_at": "REAL DEFAULT 0",
+                "context": "TEXT DEFAULT '[]'",
+                "source": "TEXT DEFAULT ''",
+                "with_owner": "INTEGER DEFAULT 0",
+                "partition_key": "TEXT DEFAULT ''",
+                "topic": "TEXT DEFAULT ''",
+                "privacy": "TEXT DEFAULT ''",
+            }
+            cur = await db.execute("PRAGMA table_info(atoms)")
+            existing = {row[1] for row in await cur.fetchall()}
+            added = []
+            for _col, _decl in _new_cols.items():
+                if _col not in existing:
+                    await db.execute(f"ALTER TABLE atoms ADD COLUMN {_col} {_decl}")
+                    added.append(_col)
+            if added:
+                logger.info(f"[human_like_mem] 老库迁移：补列 {added}")
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mem_time ON memories(create_time)"
             )
@@ -360,18 +403,20 @@ class MemoryStore:
                     """
                     INSERT INTO atoms (
                         memory_id, content, layer, mtype, subtype, classify_conf,
-                        nature, nature_conf, nature_source, who_id, who_name,
+                        nature, nature_conf, nature_source, who_id, who_name, person_ids,
                         said_at, context, source, with_owner, partition_key, topic,
                         privacy, status, importance, create_time, last_access,
                         last_reinforce, reinforce_count, ttl_days, expires_at,
                         session_id, persona_id, metadata
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         atom.memory_id, atom.content, atom.layer, atom.mtype,
                         atom.subtype, atom.classify_conf, atom.nature,
                         atom.nature_conf, atom.nature_source, atom.who_id,
-                        atom.who_name, atom.said_at,
+                        atom.who_name,
+                        json.dumps(atom.person_ids or [], ensure_ascii=False),
+                        atom.said_at,
                         json.dumps(atom.context or [], ensure_ascii=False),
                         atom.source, 1 if atom.with_owner else 0,
                         atom.partition_key, atom.topic, atom.privacy,
@@ -845,6 +890,7 @@ class MemoryStore:
             nature_source=str(g("nature_source") or ""),
             who_id=str(g("who_id") or ""),
             who_name=str(g("who_name") or ""),
+            person_ids=(_json_list(g("person_ids"))),
             said_at=float(g("said_at") or 0),
             context=ctx if isinstance(ctx, list) else [],
             source=str(g("source") or ""),

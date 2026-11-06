@@ -1,7 +1,7 @@
 ﻿name: astrbot_plugin_human_like_memory
 display_name: Human-like Memory
 author: 噩壤
-version: 1.3.0
+version: 2.3.0
 desc: 类人长期记忆：新记忆先进短时暂存区，定性后才转正式库。带分区、定性、回溯比对、红线过滤和纠错入口。关键词+可选语义双路检索。
 short_desc: 短时暂存 + 定性转正的两层长期记忆
 repo: "https://github.com/lingchenyinmeng/human-like-memory"
