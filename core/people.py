@@ -35,6 +35,11 @@ REL_TYPES: tuple[str, ...] = (
 TAG_KINDS: tuple[str, ...] = ("qq", "real_name", "nickname", "alias", "group_card")
 
 # 来源与可信度
+# 「我」是中心节点：所有关系至少一端是铃光
+ME_ID = "me"
+ME_NAME = "铃光"
+ME_ALIASES = ("铃光", "小光", "我", "光")
+
 SOURCE_OWNER = "owner"        # 主人亲口 → 钉死
 SOURCE_OTHER = "other"        # 别人说的 → 照收
 SOURCE_INFERRED = "inferred"  # 我自己推的 → 只当线索
@@ -130,12 +135,15 @@ class PeopleStore:
                     last_seen REAL DEFAULT 0,
                     mention_count INTEGER DEFAULT 0,
                     importance REAL DEFAULT 0.5,
-                    status TEXT DEFAULT 'active'
+                    status TEXT DEFAULT 'active',
+                    -- 「我」的那条是 1，全局唯一
+                    is_me INTEGER DEFAULT 0
                 )
                 """
             )
             # 老库迁移：people 表后加的列
             _people_cols = {
+                "is_me": "INTEGER DEFAULT 0",
                 "last_seen": "REAL DEFAULT 0",
                 "mention_count": "INTEGER DEFAULT 0",
                 "importance": "REAL DEFAULT 0.5",
@@ -201,7 +209,9 @@ class PeopleStore:
                     source TEXT DEFAULT 'inferred',
                     updated_by TEXT DEFAULT '',
                     updated_at REAL NOT NULL,
-                    note TEXT DEFAULT ''
+                    note TEXT DEFAULT '',
+                    -- 底色：我对 b 的真实感受，一句话人话，不是标签
+                    tone TEXT DEFAULT ''
                 )
                 """
             )
@@ -237,6 +247,60 @@ class PeopleStore:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tag_value ON person_tags(kind, value)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_rel_a ON relations(a_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_rel_b ON relations(b_id)")
+            # 底色历史：改一次留一条
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tone_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    edge_id INTEGER NOT NULL,
+                    old_tone TEXT DEFAULT '',
+                    new_tone TEXT DEFAULT '',
+                    reason TEXT DEFAULT '',
+                    changed_by TEXT DEFAULT '',
+                    changed_at REAL NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tone_edge ON tone_history(edge_id)"
+            )
+
+            # relations 后加的 tone 列（老库补上）
+            cur = await db.execute("PRAGMA table_info(relations)")
+            rel_have = {row[1] for row in await cur.fetchall()}
+            if "tone" not in rel_have:
+                await db.execute("ALTER TABLE relations ADD COLUMN tone TEXT DEFAULT ''")
+                logger.info("[human_like_mem] relations 迁移：补列 ['tone']")
+
+            # 「我」这个节点，全局唯一先建好
+            await db.execute(
+                "INSERT OR IGNORE INTO people(person_id, created_at, note, "
+                "is_unknown, last_seen, mention_count, importance, status, is_me) "
+                "VALUES (?, ?, ?, 0, ?, 0, 1.0, 'active', 1)",
+                (ME_ID, time.time(), f"{ME_NAME}自己", time.time()),
+            )
+            # 名字也挂上，方便「铃光」被 resolve 到 me
+            # 先查有没有，避免重复插入（person_tags 没有唯一约束）
+            for _alias in ME_ALIASES:
+                cur = await db.execute(
+                    "SELECT tag_id FROM person_tags WHERE person_id = ? AND kind = 'nickname' AND value = ?",
+                    (ME_ID, _alias),
+                )
+                if await cur.fetchone() is None:
+                    await db.execute(
+                        "INSERT INTO person_tags(person_id, kind, value, "
+                        "source, confidence, seen_at, note, status, source_raw) "
+                        "VALUES (?, 'nickname', ?, 'owner', 1.0, ?, '', 'confirmed', ?)",
+                        (ME_ID, _alias, time.time(), f"「我」的固定叫法 {_alias}"),
+                    )
+            # 老库里可能已经有重复的，清一下
+            await db.execute(
+                "DELETE FROM person_tags WHERE person_id = ? AND tag_id NOT IN ("
+                "SELECT MIN(tag_id) FROM person_tags WHERE person_id = ? "
+                "GROUP BY kind, value)",
+                (ME_ID, ME_ID),
+            )
+
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ev_edge ON relation_evidence(edge_id)"
             )
@@ -423,6 +487,10 @@ class PeopleStore:
         qq = str(qq or "").strip()
         name = str(name or "").strip()
 
+        # 0. 「我」永远是自己，不新建也不合并到别人
+        if name and name in ME_ALIASES:
+            return ME_ID
+
         # 1. 按 QQ 号认（最可靠）
         if qq:
             hits = await self.find_by_tag("qq", qq)
@@ -473,6 +541,7 @@ class PeopleStore:
         from_ts: float | None = None,
         note: str = "",
         updated_by: str = "",
+        tone: str = "",
     ) -> int:
         """加一条关系边。同样的 (a,b,type) 还在生效中就更新它，不重复开。"""
         if not a_id or not b_id or a_id == b_id:
@@ -493,17 +562,19 @@ class PeopleStore:
                 await db.execute(
                     "UPDATE relations SET confidence = MAX(confidence, ?), "
                     "source = CASE WHEN ? >= confidence THEN ? ELSE source END, "
-                    "updated_by = ?, updated_at = ?, note = ? WHERE edge_id = ?",
-                    (conf, conf, source, updated_by, now, note, int(row["edge_id"])),
+                    "updated_by = ?, updated_at = ?, note = ?, "
+                    "tone = CASE WHEN ? != '' THEN ? ELSE tone END WHERE edge_id = ?",
+                    (conf, conf, source, updated_by, now, note,
+                     tone, tone, int(row["edge_id"])),
                 )
                 eid = int(row["edge_id"])
             else:
                 cur = await db.execute(
                     "INSERT INTO relations(a_id, b_id, rel_type, direction, from_ts, to_ts, "
-                    "confidence, source, updated_by, updated_at, note) "
-                    "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+                    "confidence, source, updated_by, updated_at, note, tone) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
                     (a_id, b_id, rel_type, direction, from_ts or now, conf, source,
-                     updated_by, now, note),
+                     updated_by, now, note, tone),
                 )
                 eid = int(cur.lastrowid)
             await db.commit()
@@ -621,6 +692,113 @@ class PeopleStore:
             "status": status,
             "conflicts": conflicts,
         }
+
+    # ---------- 底色 ----------
+
+    async def set_tone(
+        self,
+        a_id: str,
+        b_id: str,
+        tone: str,
+        *,
+        rel_type: str = "熟人",
+        reason: str = "",
+        changed_by: str = "铃光",
+        source: str = SOURCE_INFERRED,
+    ) -> dict:
+        """改「a 对 b 的底色」。改之前的值进 tone_history。
+
+        底色是一句话人话（"见到他会开心，也怕他嫌我话多"），不是标签。
+        """
+        tone = str(tone or "").strip()[:120]
+        if not a_id or not b_id or a_id == b_id or not tone:
+            return {"ok": False, "reason": "参数不合法"}
+        now = time.time()
+
+        # 找到（或建）这条边
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT edge_id, tone FROM relations WHERE a_id = ? AND b_id = ? "
+                "AND to_ts IS NULL ORDER BY edge_id DESC LIMIT 1",
+                (a_id, b_id),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                # 没边就建一条
+                cur = await db.execute(
+                    "INSERT INTO relations(a_id, b_id, rel_type, direction, from_ts, "
+                    "to_ts, confidence, source, updated_by, updated_at, note, tone) "
+                    "VALUES (?, ?, ?, 'a_to_b', ?, NULL, 0.5, ?, ?, ?, '', ?)",
+                    (a_id, b_id, rel_type, now, source, changed_by, now, tone),
+                )
+                edge_id = int(cur.lastrowid)
+                old_tone = ""
+                await db.commit()  # 新边必须先落盘，下面那个连接才看得到
+            else:
+                edge_id = int(row["edge_id"])
+                old_tone = str(row["tone"] or "")
+                if old_tone == tone:
+                    return {"ok": True, "edge_id": edge_id, "changed": False,
+                            "tone": tone}
+
+        # 留痕 + 更新
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO tone_history(edge_id, old_tone, new_tone, reason, "
+                "changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (edge_id, old_tone, tone, str(reason or "")[:200], changed_by, now),
+            )
+            await db.execute(
+                "UPDATE relations SET tone = ?, updated_at = ?, updated_by = ? "
+                "WHERE edge_id = ?",
+                (tone, now, changed_by, edge_id),
+            )
+            await db.commit()
+        return {"ok": True, "edge_id": edge_id, "changed": True, "tone": tone}
+
+    async def tone_of(self, a_id: str, b_id: str) -> str:
+        """a 对 b 现在是什么底色。"""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT tone FROM relations WHERE a_id = ? AND b_id = ? "
+                "AND to_ts IS NULL ORDER BY edge_id DESC LIMIT 1",
+                (a_id, b_id),
+            )
+            row = await cur.fetchone()
+        return str(row["tone"] or "") if row else ""
+
+    async def tones_of_me(self, limit: int = 12) -> list[dict]:
+        """「我」对所有人的底色，按最近更新排。"""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT r.b_id, r.rel_type, r.tone, r.updated_at, "
+                "(SELECT value FROM person_tags t WHERE t.person_id = r.b_id "
+                "  AND t.kind IN ('real_name','nickname','alias') "
+                "  AND t.value NOT GLOB '[0-9]*' "
+                "  ORDER BY CASE t.kind WHEN 'real_name' THEN 0 "
+                "           WHEN 'nickname' THEN 1 ELSE 2 END "
+                "  LIMIT 1) AS name "
+                "FROM relations r WHERE r.a_id = ? AND r.to_ts IS NULL "
+                "AND COALESCE(r.tone,'') != '' "
+                "ORDER BY r.updated_at DESC LIMIT ?",
+                (ME_ID, max(1, limit)),
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+        # 取不到名字就用 id，别显示空白
+        for r in rows:
+            if not r.get("name"):
+                r["name"] = str(r.get("b_id") or "")
+        return rows
+
+    async def tone_history_of(self, edge_id: int, limit: int = 20) -> list[dict]:
+        """一条边的底色变更历史。"""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT old_tone, new_tone, reason, changed_by, changed_at "
+                "FROM tone_history WHERE edge_id = ? ORDER BY changed_at DESC LIMIT ?",
+                (edge_id, max(1, limit)),
+            )
+            return [dict(r) for r in await cur.fetchall()]
 
     async def evidence_of(self, edge_id: int) -> list[dict]:
         """一条关系目前的全部证据。"""
@@ -756,6 +934,6 @@ class PeopleStore:
 
 
 __all__ = [
-    "PeopleStore", "REL_TYPES", "TAG_KINDS",
+    "PeopleStore", "REL_TYPES", "TAG_KINDS", "ME_ID", "ME_NAME",
     "SOURCE_OWNER", "SOURCE_OTHER", "SOURCE_INFERRED", "SOURCE_CONF",
 ]

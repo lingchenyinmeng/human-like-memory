@@ -50,6 +50,8 @@ class LingguangMemory(Star):
         self.injector: Injector | None = None
         self._loop_task: asyncio.Task | None = None
         self._last_ask = 0.0
+        # 底色判断的会话级冷却
+        self._tone_checked: dict[str, float] = {}
         self._backfill_seen: set[str] = set()
 
     # ---------- 配置 ----------
@@ -541,6 +543,101 @@ class LingguangMemory(Star):
             return ""
         logger.debug(f"[human_like_mem] 补关系（{reasons[0]}）")
         return "[你记得的人际关系]\n" + "\n".join(lines[:6])
+    # ---------- 底色：对话后判断感受变了吗 ----------
+
+    @filter.on_llm_response()
+    async def _tone_after_reply(self, event: AstrMessageEvent, response) -> None:
+        """每轮回复后，后台判断这轮有没有改变她对说话人的感受。
+
+        不阻塞回复：扔到后台任务里跑。
+        """
+        try:
+            asyncio.create_task(self._judge_tone(event, response))
+        except Exception:
+            pass
+
+    async def _judge_tone(self, event: AstrMessageEvent, response) -> None:
+        if self.people is None:
+            return
+        try:
+            cooldown = float(self.conf.get("tone_check_cooldown", 1800) or 1800)
+            session = str(event.unified_msg_origin or "")
+            now = time.time()
+            if now - self._tone_checked.get(session, 0.0) < cooldown:
+                return
+            self._tone_checked[session] = now
+
+            who_id = str(event.get_sender_id() or "").strip()
+            who_name = str(event.get_sender_name() or "").strip()
+            if not who_name:
+                return
+            # 忽略命令和空消息
+            user_text = str(event.message_str or "").strip()
+            if not user_text or len(user_text) < 4:
+                return
+            if user_text.startswith(("/", "!", "#")):
+                return
+
+            reply = str(getattr(response, "completion_text", "") or "").strip()
+            if not reply:
+                return
+
+            from .core.people import ME_ID
+
+            pid = await self.people.resolve(
+                qq=who_id, name=who_name, create_if_missing=True
+            )
+            if not pid or pid == ME_ID:
+                return
+
+            current = await self.people.tone_of(ME_ID, pid)
+            prompt = (
+                f"你刚跟「{who_name}」聊了几句。\n"
+                f"他说：{user_text[:200]}\n"
+                f"你回：{reply[:200]}\n"
+                f"你现在对他的感受是：{current or '（还没想过）'}\n\n"
+                "这轮对话有没有让你对他的感受真的变了？"
+                "只有确实变了才改——一次被夸/被骂不算，"
+                "得是让你对他这个人有新的认识。\n"
+                "用 JSON 回答，不要别的：\n"
+                '{"changed": true/false, "tone": "新的感受一句话40字内第一人称写具体不空泛", "reason": "为什么变"}'
+            )
+            provider = self.context.get_using_provider()
+            if provider is None:
+                return
+            resp = await provider.text_chat(prompt=prompt, contexts=[])
+            raw = str(getattr(resp, "completion_text", "") or "").strip()
+            if "```" in raw:
+                for seg in raw.split("```"):
+                    seg = seg.strip()
+                    if seg.startswith("json"):
+                        seg = seg[4:].strip()
+                    if seg.startswith("{"):
+                        raw = seg
+                        break
+            i, j = raw.find("{"), raw.rfind("}")
+            if i < 0 or j <= i:
+                return
+            obj = json.loads(raw[i : j + 1])
+            if not obj.get("changed"):
+                return
+            new_tone = str(obj.get("tone") or "").strip()[:80]
+            if not new_tone:
+                return
+            res = await self.people.set_tone(
+                ME_ID, pid, new_tone,
+                reason=str(obj.get("reason") or "")[:150],
+                changed_by="铃光",
+            )
+            if res.get("changed"):
+                logger.info(
+                    f"[human_like_mem] 底色更新 {who_name}：{new_tone[:36]}"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"[human_like_mem] 判断底色失败: {e!r}")
+
     @filter.on_llm_request()
     async def _inject(self, event: AstrMessageEvent, req: ProviderRequest):
         if self.store is None or self.injector is None:
@@ -567,11 +664,18 @@ class LingguangMemory(Star):
                     continue
                 seen.add(a.atom_id)
                 merged.append(a)
+            tones = []
+            try:
+                if self.people is not None:
+                    tones = await self.people.tones_of_me(limit=12)
+            except Exception as e:
+                logger.debug(f"[human_like_mem] 取底色失败: {e!r}")
             text = self.injector.build(
                 merged,
                 is_group=is_group,
                 owner_id=self.owner_id,
                 max_chars=int(self.conf.get("inject_max_chars", 400) or 400),
+                tones=tones,
             )
             # 按六条规则决定要不要补人际关系
             try:
@@ -810,6 +914,7 @@ class LingguangMemory(Star):
     async def relate(
         self, event: AstrMessageEvent, a: str = "", b: str = "",
         rel_type: str = "", said_by: str = "", guessed: bool = False, note: str = "",
+        tone: str = "",
     ):
         '''记两个人是什么关系。**单方说了不算定论**，要多方印证。
 
@@ -820,6 +925,7 @@ class LingguangMemory(Star):
             said_by(string): 是谁说的（名字或 QQ 号）。留空 = 主人说的
             guessed(bool): 是你自己推测出来的吗？是的话只当线索
             note(string): 原话或备注
+            tone(string): 我对这个人的真实感受，一句话（比如「见到他会开心，也怕他嫌我话多」）
         '''
         if self.people is None:
             return "人库还没准备好。"
@@ -853,6 +959,17 @@ class LingguangMemory(Star):
                 a_id, b_id, rt, speaker=speaker, speaker_kind=kind,
                 quote=str(note or ""),
             )
+            # 有底色就顺手记上（「我」对某人的感受）
+            if tone and str(tone).strip():
+                try:
+                    from .core.people import ME_ID
+
+                    await self.people.set_tone(
+                        ME_ID, b_id, str(tone), rel_type=rt,
+                        reason=str(note or ""), changed_by="铃光",
+                    )
+                except Exception as e:
+                    logger.debug(f"[human_like_mem] 记底色失败: {e!r}")
             if not res.get("ok"):
                 return f"没记上：{res.get('reason')}"
 
@@ -869,6 +986,36 @@ class LingguangMemory(Star):
             logger.warning(f"[human_like_mem] relate 失败: {e!r}")
             return "记关系的时候出错了。"
 
+
+    @filter.llm_tool(name="how_i_feel_about")
+    async def how_i_feel_about(self, event: AstrMessageEvent, name: str = ""):
+        '''查「我对这个人是什么感受」。主人问「你怎么看某某」时用。
+
+        Args:
+            name(string): 名字或 QQ 号
+        '''
+        if self.people is None:
+            return "人库还没准备好。"
+        try:
+            from .core.people import ME_ID
+
+            pid = await self.people.resolve(name=str(name or ""), create_if_missing=False)
+            if not pid:
+                return f"我不认识 {name}。"
+            tone = await self.people.tone_of(ME_ID, pid)
+            if not tone:
+                return f"对 {name} 还没想过什么。"
+            card = await self.people.describe(pid)
+            rtype = ""
+            for r in card.get("relations") or []:
+                if r.get("a_id") == ME_ID:
+                    rtype = str(r.get("rel_type") or "")
+                    break
+            label = f"（{rtype}）" if rtype else ""
+            return f"{name}{label}：{tone}"
+        except Exception as e:
+            logger.warning(f"[human_like_mem] how_i_feel_about 失败: {e!r}")
+            return "查感受的时候出错了。"
 
     @filter.llm_tool(name="memory_status")
     async def memory_status(self, event: AstrMessageEvent):

@@ -51,6 +51,38 @@ class Injector:
     def __init__(self, config: dict | None = None):
         self.config = config or {}
 
+    @staticmethod
+    def _format_tones(tones: list[dict], *, limit: int = 200) -> str:
+        """底色段：「我」对别人是什么感受。
+
+        单独成段、排在最前、独占 200 字额度——它影响的是语气，
+        不是事实，所以不跟事件记忆抢位置。
+        """
+        if not tones:
+            return ""
+        rows = []
+        used = 0
+        for t in tones:
+            name = str(t.get("name") or t.get("b_id") or "").strip()
+            tone = str(t.get("tone") or "").strip()
+            if not name or not tone:
+                continue
+            rtype = str(t.get("rel_type") or "").strip()
+            label = f"{name}（{rtype}）" if rtype else name
+            line = f"- {label}：{tone}"
+            if used + len(line) > limit:
+                break
+            rows.append(line)
+            used += len(line) + 1
+        if not rows:
+            return ""
+        return (
+            "[你的人际关系]\n"
+            "（「我」是铃光，下面是铃光对各人的真实感受）\n"
+            + "\n".join(rows)
+            + "\n[这些只是你自己的底色，别复述，也别主动说出来；影响语气就行。]"
+        )
+
     def build(
         self,
         atoms: list[Atom],
@@ -58,8 +90,12 @@ class Injector:
         is_group: bool = False,
         owner_id: str = "",
         max_chars: int = 400,
+        tones: list[dict] | None = None,
     ) -> str:
-        """生成注入文本。空列表返回空串。"""
+        """生成注入文本。空列表返回空串。
+
+        tones 是「我」对别人的底色，单独成段插在最前面。
+        """
         now = time.time()
         cold = float(self.config.get("dormant_recall_penalty", 0.3) or 0.3)
 
@@ -114,7 +150,9 @@ class Injector:
             lines.append("最近的事：")
             lines.extend(format_atom(a, now) for a in extras[:5])
 
-        if not lines:
+        tone_block = self._format_tones(tones or [])
+
+        if not lines and not tone_block:
             return ""
 
         head = (
@@ -126,6 +164,9 @@ class Injector:
         body = head + "\n".join(lines) + tail
         if len(body) > max_chars:
             body = body[: max_chars - 1] + "…]"
+        # 底色排最前，单独占额度，不跟事件记忆抢
+        if tone_block:
+            return tone_block + "\n\n" + body if body else tone_block
         return body
 
 
