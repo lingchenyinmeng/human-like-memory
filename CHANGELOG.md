@@ -1,5 +1,57 @@
 # 更新记录
 
+## 2.8.0 (2026-11-17)
+
+修「谁对谁」判错的问题。
+
+### 问题
+
+迁移过来的 931 条记忆 `source` 为空（livingmemory 的全局池子，不分群也不分私聊）。
+判断 `layer`（谁对谁）时只能默认「别人之间」，结果主人说的话也被当成闲聊。
+
+### 数据实况
+
+```
+source 空的 931 条：
+  who_name 含「噩壤」  509  ← 能确认是主人说的
+  who_name 是别人      188
+  who_name 也空        234  ← 真的不知道
+```
+
+### 修法
+
+**1. `classify_layer` 支持按名字认主人**
+
+以前只看 `who_id == owner_id`。但迁移数据 `who_id` 是空的，只有 `who_name`。
+现在 `who_name` 含主人名也算。
+
+新增配置 `owner_name`（默认「噩壤」）。
+
+**2. 回填 source**
+
+| 情况 | 处理 |
+|---|---|
+| `who_name` 含主人名 | 补 `who_id`，`source = 'private'` |
+| `who_name` 是别人 | `source = 'group'` |
+| `who_name` 也空 | `source = 'unknown'` |
+
+**3. `source = 'unknown'` 不进注入**
+
+`injector.build` 里直接跳过。宁可少记，也不把「不知道谁对谁说」的塞进上下文。
+
+### 结果
+
+```
+source:  group 1943 / private 707 / unknown 234
+layer:   owner_to_me 428 / owner_to_other 211 / other_to_me 187
+         me_to_owner 109 / me_to_other 79 / other_to_other 1870
+```
+
+**私聊里「主人对铃光」从 1 条变成 428 条。**
+
+### 新增脚本
+
+`tools/fix_source.py` —— 修 source 为空 + 重算 layer，幂等。
 ## 2.7.0 (2026-11-16)
 
 判性质要留证据，改判要能回档，外号要能追。

@@ -82,6 +82,11 @@ class LingguangMemory(Star):
         }
 
     @property
+    def owner_name(self) -> str:
+        """主人叫什么。迁移过来的老记忆没有 who_id，靠名字认。"""
+        return str(self.conf.get("owner_name", "噩壤") or "噩壤").strip()
+
+    @property
     def owner_id(self) -> str:
         qq = str(self.conf.get("owner_qq") or "").strip()
         if qq:
@@ -383,6 +388,7 @@ class LingguangMemory(Star):
             mem.key_facts,
             memory_id=mem.memory_id,
             owner_id=self.owner_id,
+            owner_name=self.owner_name,
             who_id=who_id,
             who_name=who_name,
             source=source,

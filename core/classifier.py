@@ -81,16 +81,24 @@ def classify_layer(
     text: str,
     *,
     owner_id: str = "",
+    owner_name: str = "",
     who_id: str = "",
     who_name: str = "",
     source: str = "",
     identities: list[dict] | None = None,
 ) -> str:
-    """判 layer（谁对谁）。"""
+    """判 layer（谁对谁）。
+
+    加 owner_name 的原因：迁移过来的老记忆 who_id 是空的、只有 who_name，
+    光看 who_id 判不出「这是主人说的」，结果全归到「别人之间」。
+    """
+    owner_name = str(owner_name or "").strip()
     t = str(text or "")
     owner = str(owner_id or "").strip()
     who = str(who_id or "").strip()
-    is_owner = bool(owner and who == owner)
+    is_owner = bool(owner and who == owner) or bool(
+        owner_name and who_name and owner_name in who_name
+    )
     name_to_id: dict[str, str] = {}
     for ident in identities or []:
         if not isinstance(ident, dict):
@@ -161,6 +169,7 @@ def build_atoms(
     *,
     memory_id: int = 0,
     owner_id: str = "",
+    owner_name: str = "",
     who_id: str = "",
     who_name: str = "",
     source: str = "",
@@ -184,7 +193,7 @@ def build_atoms(
         mtype, tconf = classify_type(fact)
         subtype = classify_subtype(mtype, fact)
         layer = classify_layer(
-            fact, owner_id=owner_id, who_id=who_id,
+            fact, owner_id=owner_id, owner_name=owner_name, who_id=who_id,
             who_name=who_name, source=source, identities=identities,
         )
 

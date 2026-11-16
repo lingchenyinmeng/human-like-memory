@@ -70,6 +70,10 @@ class Injector:
         extras: list[Atom] = []
 
         for atom in atoms or []:
+            # 来源不明的（迁移老数据，连是群还是私聊都不知道）不进注入。
+            # 宁可少记，也不把「不知道谁对谁说」的东西塞进上下文。
+            if (atom.source or "") == "unknown":
+                continue
             # 红线：群聊里剔掉主人私聊和私密内容
             if is_group:
                 if atom.with_owner:
