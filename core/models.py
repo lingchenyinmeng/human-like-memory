@@ -140,6 +140,14 @@ class Atom:
     nature: str = ""
     nature_conf: float = 0.0
     nature_source: str = ""  # rule / history / assume / owner
+    # 判据：为什么判成这个性质。空着也行，但填了就能复核。
+    nature_reason: str = ""
+    # 原文摘录或触发的关键词，方便回看当时看到的是什么
+    nature_evidence: str = ""
+    # 谁判的：rule（正则）/ llm（模型）/ owner（主人纠正）/ history（历史参考）
+    nature_by: str = ""
+    # 改判次数，改一次 +1，旧值进 atom_nature_history
+    nature_ver: int = 0
 
     # 来源与上下文
     who_id: str = ""

@@ -1,5 +1,66 @@
 # 更新记录
 
+## 2.7.0 (2026-11-16)
+
+判性质要留证据，改判要能回档，外号要能追。
+
+### 一、性质带判据
+
+以前只存 `nature / nature_conf / nature_source`，判了不知道为什么，改错了也没法回看。
+
+新增 4 个字段：
+
+| 字段 | 存什么 |
+|---|---|
+| `nature_reason` | 为什么判成这个性质，一句话 |
+| `nature_evidence` | 原文摘录或触发的关键词 |
+| `nature_by` | 谁判的：rule / history / assume / owner |
+| `nature_ver` | 改判次数，改一次 +1 |
+
+判据示例：
+
+```
+正文有玩笑语气（置信 0.75），盖过 mtype=blame 定下的「scold」；触发片段：哈哈哈你个笨蛋
+```
+
+### 二、改判留档
+
+新表 `atom_nature_history`：
+
+```
+atom_id, old_nature, old_reason, new_nature, new_reason, changed_by, changed_at
+```
+
+`correct_memory` 改一条性质时自动写一条历史。性质没变但理由变了也记。
+
+查历史：`store.nature_history(atom_id)`。
+
+### 三、外号可追
+
+`person_tags` 加两列：
+
+| 列 | 值 |
+|---|---|
+| `status` | `confirmed` / `guess` / `rejected` |
+| `source_raw` | 原话，或「群昵称：A点歌台沅姐」 |
+
+**来源决定默认状态**：
+
+- 主人亲口说 → `confirmed`
+- 别人说的 → `guess`
+- 自己推的（比如看群昵称猜的）→ `guess`
+
+**状态只能往强了升**——`confirmed` 不会被后来的 `guess` 覆盖。
+
+### 为什么加这个
+
+线上出过事：看到群昵称「A点歌台沅姐」，就认定「沅姐」是她认可的称呼，后来被主人拆穿是编的。
+
+现在能查到这个外号是哪来的：`source_type=inferred` + `source_raw="群昵称：A点歌台沅姐"` + `status=guess`。
+
+### 迁移
+
+老库自动补列，幂等。2801 条原子不受影响，FTS 和向量索引没动。
 ## 2.6.0 (2026-11-06)
 
 补齐转正的另外两条路。

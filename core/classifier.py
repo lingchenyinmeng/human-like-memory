@@ -189,7 +189,7 @@ def build_atoms(
         )
 
         # 定性：按 mtype 定基调，正则只细化语气（避免两套规则打架）
-        raw_nature, raw_conf = resolve_nature(mtype, fact)
+        raw_nature, raw_conf, raw_reason, raw_evidence = resolve_nature(mtype, fact)
         nature, nconf, nsrc = apply_history(raw_nature, raw_conf, history or [])
         final_nature, tier_src, need_ask = to_tier(nature, nconf)
         if nsrc:
@@ -210,6 +210,11 @@ def build_atoms(
             nature=final_nature,
             nature_conf=nconf,
             nature_source=tier_src,
+            # 判据：为什么判成这个性质、看到的是哪几个字、谁判的
+            nature_reason=raw_reason,
+            nature_evidence=raw_evidence,
+            nature_by=tier_src or "rule",
+            nature_ver=0,
             who_id=who_id,
             who_name=who_name,
             said_at=float(said_at or now),

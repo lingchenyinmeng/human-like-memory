@@ -96,7 +96,7 @@ def apply_history(
     return nature, conf, ""
 
 
-__all__ = ["RULES", "NATURE_CN", "MTYPE_NATURE", "classify_nature", "resolve_nature", "to_tier", "apply_history"]
+__all__ = ["RULES", "NATURE_CN", "MTYPE_NATURE", "classify_nature", "resolve_nature", "_find_evidence", "to_tier", "apply_history"]
 
 # mtype → nature 基调（mtype 是"在说什么"，nature 是"什么语气"）
 MTYPE_NATURE: dict[str, str] = {
@@ -111,7 +111,27 @@ MTYPE_NATURE: dict[str, str] = {
 }
 
 
-def resolve_nature(mtype: str, text: str) -> tuple[str, float]:
+def _find_evidence(text: str) -> str:
+    """找出命中的关键词，截一段原文当证据。
+
+    判据光写「有玩笑语气」不够，得能让人一眼看到是哪几个字触发的。
+    """
+    s = str(text or "")
+    if not s:
+        return ""
+    for _nature, pattern, _conf in RULES:
+        try:
+            m = re.search(pattern, s)
+        except re.error:
+            continue
+        if m:
+            start = max(0, m.start() - 6)
+            end = min(len(s), m.end() + 6)
+            return s[start:end].strip()[:60]
+    return ""
+
+
+def resolve_nature(mtype: str, text: str) -> tuple[str, float, str, str]:
     """定性质：先按 mtype 定基调，再让正则细化语气。
 
     这样 mtype=praise 的话不会再被判成「陈述句」——
@@ -119,12 +139,22 @@ def resolve_nature(mtype: str, text: str) -> tuple[str, float]:
     """
     base = MTYPE_NATURE.get(str(mtype or ""), "fact")
     raw, conf = classify_nature(text)
+    evidence = _find_evidence(text) if raw in ("joke", "scold") else ""
 
     # 「玩笑」是语气，可以盖过任何基调：夸奖也能是玩笑
     if raw == "joke" and conf >= 0.70:
-        return "joke", conf
+        reason = f"正文有玩笑语气（置信 {conf:.2f}），盖过 mtype={mtype} 定下的「{base}」"
+        if evidence:
+            reason += f"；触发片段：{evidence}"
+        return "joke", conf, reason, evidence
     # 「真骂」也是语气
     if raw == "scold" and conf >= 0.75:
-        return "scold", conf
+        reason = f"正文有骂人词（置信 {conf:.2f}），盖过 mtype={mtype} 定下的「{base}」"
+        if evidence:
+            reason += f"；触发片段：{evidence}"
+        return "scold", conf, reason, evidence
     # 其余情况：用 mtype 定的基调，置信度至少 0.72（够转正门槛）
-    return base, max(conf, 0.72)
+    reason = f"没命中玩笑/骂人词，按 mtype={mtype} 的基调定为「{base}」"
+    return base, max(conf, 0.72), reason, ""
+
+

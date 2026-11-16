@@ -194,6 +194,10 @@ class MemoryStore:
                     nature TEXT DEFAULT '',
                     nature_conf REAL DEFAULT 0,
                     nature_source TEXT DEFAULT '',
+                    nature_reason TEXT DEFAULT '',
+                    nature_evidence TEXT DEFAULT '',
+                    nature_by TEXT DEFAULT '',
+                    nature_ver INTEGER DEFAULT 0,
                     who_id TEXT DEFAULT '',
                     who_name TEXT DEFAULT '',
                     person_ids TEXT DEFAULT '[]',
@@ -227,6 +231,10 @@ class MemoryStore:
                 "nature": "TEXT DEFAULT ''",
                 "nature_conf": "REAL DEFAULT 0",
                 "nature_source": "TEXT DEFAULT ''",
+                "nature_reason": "TEXT DEFAULT ''",
+                "nature_evidence": "TEXT DEFAULT ''",
+                "nature_by": "TEXT DEFAULT ''",
+                "nature_ver": "INTEGER DEFAULT 0",
                 "who_id": "TEXT DEFAULT ''",
                 "who_name": "TEXT DEFAULT ''",
                 "person_ids": "TEXT DEFAULT '[]'",
@@ -247,6 +255,24 @@ class MemoryStore:
                     added.append(_col)
             if added:
                 logger.info(f"[human_like_mem] 老库迁移：补列 {added}")
+            # 改判历史：correct_memory 改一次性质就留一条，能回看原来怎么想的
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS atom_nature_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    atom_id INTEGER NOT NULL,
+                    old_nature TEXT DEFAULT '',
+                    old_reason TEXT DEFAULT '',
+                    new_nature TEXT DEFAULT '',
+                    new_reason TEXT DEFAULT '',
+                    changed_by TEXT DEFAULT '',
+                    changed_at REAL NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nathist_atom ON atom_nature_history(atom_id)"
+            )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mem_time ON memories(create_time)"
             )
@@ -462,17 +488,21 @@ class MemoryStore:
                     """
                     INSERT INTO atoms (
                         memory_id, content, layer, mtype, subtype, classify_conf,
-                        nature, nature_conf, nature_source, who_id, who_name, person_ids,
+                        nature, nature_conf, nature_source,
+                        nature_reason, nature_evidence, nature_by, nature_ver,
+                        who_id, who_name, person_ids,
                         said_at, context, source, with_owner, partition_key, topic,
                         privacy, status, importance, create_time, last_access,
                         last_reinforce, reinforce_count, ttl_days, expires_at,
                         session_id, persona_id, metadata
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         atom.memory_id, atom.content, atom.layer, atom.mtype,
                         atom.subtype, atom.classify_conf, atom.nature,
-                        atom.nature_conf, atom.nature_source, atom.who_id,
+                        atom.nature_conf, atom.nature_source,
+                        atom.nature_reason, atom.nature_evidence,
+                        atom.nature_by, atom.nature_ver, atom.who_id,
                         atom.who_name,
                         json.dumps(atom.person_ids or [], ensure_ascii=False),
                         atom.said_at,
@@ -944,15 +974,58 @@ class MemoryStore:
 
     # ---------- 纠正 ----------
 
-    async def update_nature(self, atom_id: int, nature: str) -> bool:
+    async def update_nature(
+        self,
+        atom_id: int,
+        nature: str,
+        *,
+        reason: str = "",
+        changed_by: str = "owner",
+    ) -> bool:
+        """改判一条原子的性质，并把旧值记进历史。
+
+        旧实现直接覆盖，改错了没法回看。现在先读旧值、写历史、再更新。
+        """
+        now = time.time()
         async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT nature, nature_reason, nature_ver FROM atoms WHERE id = ?",
+                (atom_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return False
+            old_nature = str(row["nature"] or "")
+            old_reason = str(row["nature_reason"] or "")
+            old_ver = int(row["nature_ver"] or 0)
+
+            # 历史留档（性质没变就不留，免得刷一堆空记录）
+            if old_nature != nature or old_reason != reason:
+                await db.execute(
+                    "INSERT INTO atom_nature_history"
+                    "(atom_id, old_nature, old_reason, new_nature, new_reason, "
+                    "changed_by, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (atom_id, old_nature, old_reason, nature, reason, changed_by, now),
+                )
+
             cursor = await db.execute(
-                "UPDATE atoms SET nature = ?, nature_conf = 1.0, nature_source = 'owner' "
-                "WHERE id = ?",
-                (nature, atom_id),
+                "UPDATE atoms SET nature = ?, nature_conf = 1.0, nature_source = 'owner', "
+                "nature_reason = ?, nature_by = ?, nature_ver = ? WHERE id = ?",
+                (nature, reason or f"主人改判为「{nature}」", changed_by, old_ver + 1, atom_id),
             )
             await db.commit()
             return cursor.rowcount > 0
+
+    async def nature_history(self, atom_id: int, limit: int = 20) -> list[dict]:
+        """一条原子的改判历史，最近的在前面。"""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT old_nature, old_reason, new_nature, new_reason, "
+                "changed_by, changed_at FROM atom_nature_history "
+                "WHERE atom_id = ? ORDER BY changed_at DESC LIMIT ?",
+                (atom_id, max(1, limit)),
+            )
+            return [dict(r) for r in await cur.fetchall()]
 
     async def get_atom(self, atom_id: int) -> Atom | None:
         async with self._connect() as db:
@@ -1008,6 +1081,10 @@ class MemoryStore:
             nature=str(g("nature") or ""),
             nature_conf=float(g("nature_conf") or 0),
             nature_source=str(g("nature_source") or ""),
+            nature_reason=str(g("nature_reason") or ""),
+            nature_evidence=str(g("nature_evidence") or ""),
+            nature_by=str(g("nature_by") or ""),
+            nature_ver=int(g("nature_ver") or 0),
             who_id=str(g("who_id") or ""),
             who_name=str(g("who_name") or ""),
             person_ids=(_json_list(g("person_ids"))),

@@ -130,7 +130,7 @@ async def main() -> None:
             old_nature = str(r["nature"] or "")
 
             mtype, tconf = classify_type(content)
-            nature_raw, nconf = resolve_nature(mtype, content)
+            nature_raw, nconf, nreason, nevidence = resolve_nature(mtype, content)
             nature_final, nsrc, _ask = to_tier(nature_raw, nconf)
 
             # 说话人：空着才补
@@ -177,6 +177,7 @@ async def main() -> None:
             await db.execute(
                 "UPDATE atoms SET mtype = ?, subtype = ?, classify_conf = ?, "
                 "nature = ?, nature_conf = ?, nature_source = ?, "
+                "nature_reason = ?, nature_evidence = ?, nature_by = ?, "
                 "who_name = ?, person_ids = ? WHERE id = ?",
                 (
                     mtype,
@@ -185,6 +186,9 @@ async def main() -> None:
                     nature_final,
                     nconf,
                     nsrc or "reclassify",
+                    nreason,
+                    nevidence,
+                    nsrc or "rule",
                     new_name,
                     __import__("json").dumps(person_ids, ensure_ascii=False),
                     int(r["id"]),

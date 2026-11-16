@@ -740,7 +740,11 @@ class LingguangMemory(Star):
             target = hits[0] if hits else None
         if target is None:
             return "没找到要改的那条。"
-        ok = await self.store.update_nature(target.atom_id, n)
+        ok = await self.store.update_nature(
+            target.atom_id, n,
+            reason=str(reason or ""),
+            changed_by="owner",
+        )
         if not ok:
             return "改的时候出错了。"
         # 记下来，以后定性参考

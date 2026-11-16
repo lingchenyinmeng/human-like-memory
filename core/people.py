@@ -141,6 +141,20 @@ class PeopleStore:
                 "importance": "REAL DEFAULT 0.5",
                 "status": "TEXT DEFAULT 'active'",
             }
+            # person_tags 后加的两列（老库补上）
+            cur = await db.execute("PRAGMA table_info(person_tags)")
+            tag_have = {row[1] for row in await cur.fetchall()}
+            tag_added = []
+            for col, decl in (
+                ("status", "TEXT DEFAULT 'guess'"),
+                ("source_raw", "TEXT DEFAULT ''"),
+            ):
+                if col not in tag_have:
+                    await db.execute(f"ALTER TABLE person_tags ADD COLUMN {col} {decl}")
+                    tag_added.append(col)
+            if tag_added:
+                logger.info(f"[human_like_mem] person_tags 迁移：补列 {tag_added}")
+
             cur = await db.execute("PRAGMA table_info(people)")
             have = {row[1] for row in await cur.fetchall()}
             added = []
@@ -165,7 +179,11 @@ class PeopleStore:
                     source TEXT DEFAULT 'inferred',
                     confidence REAL DEFAULT 0.5,
                     seen_at REAL NOT NULL,
-                    note TEXT DEFAULT ''
+                    note TEXT DEFAULT '',
+                    -- 这个叫法确不确认：confirmed / guess / rejected
+                    status TEXT DEFAULT 'guess',
+                    -- 来源原文（原话，或「群昵称：A点歌台沅姐」）
+                    source_raw TEXT DEFAULT ''
                 )
                 """
             )
@@ -323,6 +341,13 @@ class PeopleStore:
                 await db.commit()
         return pid
 
+    # 来源 → 默认确认状态：主人亲口说 = confirmed，其余先当 guess
+    _STATUS_BY_SOURCE = {
+        SOURCE_OWNER: "confirmed",
+        SOURCE_OTHER: "guess",
+        SOURCE_INFERRED: "guess",
+    }
+
     async def add_tag(
         self,
         person_id: str,
@@ -331,8 +356,14 @@ class PeopleStore:
         source: str = SOURCE_INFERRED,
         confidence: float | None = None,
         note: str = "",
+        status: str = "",
+        source_raw: str = "",
     ) -> bool:
-        """挂一个叫法。已存在同样的 (person, kind, value) 就不重复。"""
+        """挂一个叫法。已存在同样的 (person, kind, value) 就不重复。
+
+        status 不传就按来源推：主人说的 confirmed，别人/自己推的 guess。
+        source_raw 写原话或「群昵称：xxx」，以后能追这个外号哪来的。
+        """
         val = str(value or "").strip()
         if not person_id or not val:
             return False
@@ -343,18 +374,21 @@ class PeopleStore:
                 (person_id, kind, val),
             )
             row = await cur.fetchone()
+            st = status or self._STATUS_BY_SOURCE.get(source, "guess")
             if row:
-                # 已存在：只把来源往强的方向抬（主人 > 别人 > 我推的）
+                # 已存在：置信度取高；状态只能往强了升（confirmed 不被 guess 覆盖）
                 await db.execute(
-                    "UPDATE person_tags SET confidence = MAX(confidence, ?), seen_at = ? "
+                    "UPDATE person_tags SET confidence = MAX(confidence, ?), seen_at = ?, "
+                    "status = CASE WHEN status = 'confirmed' THEN status ELSE ? END, "
+                    "source_raw = CASE WHEN ? != '' THEN ? ELSE source_raw END "
                     "WHERE tag_id = ?",
-                    (conf, time.time(), int(row["tag_id"])),
+                    (conf, time.time(), st, source_raw, source_raw, int(row["tag_id"])),
                 )
             else:
                 await db.execute(
-                    "INSERT INTO person_tags(person_id, kind, value, source, confidence, seen_at, note) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (person_id, kind, val, source, conf, time.time(), note),
+                    "INSERT INTO person_tags(person_id, kind, value, source, confidence, "
+                    "seen_at, note, status, source_raw) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (person_id, kind, val, source, conf, time.time(), note, st, source_raw),
                 )
             await db.commit()
         return True
@@ -366,8 +400,8 @@ class PeopleStore:
             return []
         async with self._connect() as db:
             cur = await db.execute(
-                "SELECT person_id, kind, value, source, confidence FROM person_tags "
-                "WHERE kind = ? AND value = ? ORDER BY confidence DESC",
+                "SELECT person_id, kind, value, source, confidence, status, source_raw "
+                "FROM person_tags WHERE kind = ? AND value = ? ORDER BY confidence DESC",
                 (kind, val),
             )
             return [dict(r) for r in await cur.fetchall()]
@@ -397,10 +431,10 @@ class PeopleStore:
                 return hits[0]["person_id"]
             if create_if_missing:
                 pid = await self.create_person(note=f"来自 QQ {qq}")
-                await self.add_tag(pid, "qq", qq, source, SOURCE_CONF.get(source))
+                await self.add_tag(pid, "qq", qq, source, SOURCE_CONF.get(source), source_raw=f"QQ号 {qq}")
                 await self.touch_person(pid)
                 if name:
-                    await self.add_tag(pid, "nickname", name, source)
+                    await self.add_tag(pid, "nickname", name, source, source_raw=f"昵称 {name}")
                 return pid
 
         # 2. 按昵称认
@@ -676,8 +710,10 @@ class PeopleStore:
         """给一个人做张名片：所有叫法 + 所有关系。"""
         async with self._connect() as db:
             cur = await db.execute(
-                "SELECT kind, value, source, confidence, seen_at FROM person_tags "
-                "WHERE person_id = ? ORDER BY confidence DESC, seen_at DESC",
+                "SELECT kind, value, source, confidence, seen_at, status, source_raw "
+                "FROM person_tags WHERE person_id = ? "
+                "ORDER BY CASE status WHEN 'confirmed' THEN 0 WHEN 'guess' THEN 1 ELSE 2 END, "
+                "confidence DESC, seen_at DESC",
                 (person_id,),
             )
             tags = [dict(r) for r in await cur.fetchall()]
